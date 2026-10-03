@@ -1,0 +1,22 @@
+[
+ {
+  "start": "0x000781F0",
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x001EBC9C",
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x001EC4DA",
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x001F0717",
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x001EFCB2",
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ }
+]
