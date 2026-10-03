@@ -311,7 +311,7 @@ void sub_001EA5B2(void)
     ecx = frame - 8;
     PUSH32(esp, 0x001EA5C6u); RECOMP_ABI_CALL(0x001E28B0u, sub_001E28B0);
 
-    nabm = MEM32(MEM32(chan) * 4 + 0x335DE0u);
+    nabm = MEM32(MEM32(chan) * 4 + 0x001EB200u);
     MEM8(nabm + 0xFEC0010Bu) = 2;
     MEM8(nabm + 0xFEC0010Bu) &= (uint8_t)~2u;   /* reset complete */
     eax = nabm;

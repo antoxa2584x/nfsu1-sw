@@ -3,12 +3,14 @@
 Xbox NTSC-U Need for Speed: Underground (title 0x45410047, XDK 5558), lifted
 to C with xboxrecomp and built for Linux and Nintendo Switch (libnx NRO).
 Started 2026-10-02 from the NFSU2 port (`..\nfsu2-xbox`, read its CLAUDE.md
-for everything the runtime does on Horizon). No git repo yet.
+for everything the runtime does on Horizon). Repo:
+https://github.com/antoxa2584x/nfsu1-sw (`main`, commits as
+`Anton Artemov <antoxa2584@gmail.com>`).
 
 ## Rules
 
 - Never commit game data (disc, `default.xbe`, `switch_sd/`) or generated C
-  (`gen/`). Ask before creating a repo, committing or pushing.
+  (`gen/`). Ask before committing or pushing.
 - The Switch build reads the **unpacked** disc at `sdmc:/switch/nfsu1x/game/`,
   never the ISO. Logs, `nfsu1x_env.txt` and shader caches live in
   `sdmc:/switch/nfsu1x/` (separate from NFSU2's `nfsu2x/`).
@@ -84,5 +86,5 @@ for everything the runtime does on Horizon). No git repo yet.
 - Linux: movies -> title -> menus -> Quick Race racing at 30 fps (vblank),
   HUD and AI fine.
 - Switch: GL and Vulkan NROs build; not run on Eden or hardware yet.
-- Loading screen still shows the NFSU2 logo (`assets/nfsu2_logo.png` ->
-  `tools/make_logo.py` -> `src/nfsu2_logo.h`); icon is NFSU2's.
+- Loading screen: NFSU1 logo (`assets/nfsu2_logo.png` ->
+  `tools/make_logo.py` -> `src/nfsu2_logo.h`); icon: SteamGridDB NFSU1 icon.
