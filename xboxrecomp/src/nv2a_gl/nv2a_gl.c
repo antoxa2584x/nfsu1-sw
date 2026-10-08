@@ -447,6 +447,22 @@ static uint32_t swizzle_index(uint32_t u, uint32_t v, uint32_t w, uint32_t h)
     return out;
 }
 
+/* The swizzle splits into an x part and a y part (their bits never share a
+ * position), so a whole image needs two small tables instead of a bit loop
+ * per texel: index(u, v) = s_swz_x[u] | s_swz_y[v]. */
+static uint32_t s_swz_x[4096], s_swz_y[4096], s_swz_w, s_swz_h;
+
+static void swizzle_tables(uint32_t w, uint32_t h)
+{
+    uint32_t i;
+    if (w == s_swz_w && h == s_swz_h)
+        return;
+    for (i = 0; i < w; i++) s_swz_x[i] = swizzle_index(i, 0, w, h);
+    for (i = 0; i < h; i++) s_swz_y[i] = swizzle_index(0, i, w, h);
+    s_swz_w = w;
+    s_swz_h = h;
+}
+
 /* SZ_I8_A8R8G8B8: 8-bit indices, swizzled, into an A8R8G8B8 palette named by
  * SET_TEXTURE_PALETTE (offset in the upper bits, length code in [3:2]:
  * 256, 128, 64 or 32 entries). The executor's decoder has no palette state,
@@ -462,17 +478,20 @@ static int decode_indexed(uint32_t va, uint32_t w, uint32_t h, uint32_t *out)
     const uint8_t *idx = mem + va;
     uint32_t x, y;
 
+    uint32_t pal[256];
+
     if (!(s_palette_reg & ~0x3Fu))
         return 0;
-    for (y = 0; y < h; y++)
-        for (x = 0; x < w; x++) {
-            uint32_t i = idx[swizzle_index(x, y, w, h)];
-            uint32_t c;
-            if (i >= entries)
-                i = 0;
-            memcpy(&c, mem + pal_va + i * 4, 4);
-            out[y * w + x] = c;
-        }
+    memcpy(pal, mem + pal_va, entries * 4);
+    for (x = entries; x < 256; x++)
+        pal[x] = pal[0];                     /* past the end reads entry 0 */
+    swizzle_tables(w, h);
+    for (y = 0; y < h; y++) {
+        const uint8_t *row = idx + s_swz_y[y];
+        uint32_t *o = out + (size_t)y * w;
+        for (x = 0; x < w; x++)
+            o[x] = pal[row[s_swz_x[x]]];
+    }
     return 1;
 }
 
@@ -637,9 +656,13 @@ static GLuint tex_get(uint32_t va, uint32_t color, uint32_t w, uint32_t h,
          * instead of a sampler call per texel. */
         const uint32_t *src = (const uint32_t *)((const uint8_t *)xbox_GetMemoryOffset() + va);
         uint32_t x, y, fill = color == 0x07 ? 0xFF000000u : 0;
-        for (y = 0; y < h; y++)
+        swizzle_tables(w, h);
+        for (y = 0; y < h; y++) {
+            const uint32_t *row = src + s_swz_y[y];
+            uint32_t *out = s_decode + (size_t)y * w;
             for (x = 0; x < w; x++)
-                s_decode[(size_t)y * w + x] = src[swizzle_index(x, y, w, h)] | fill;
+                out[x] = row[s_swz_x[x]] | fill;
+        }
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)w, (GLsizei)h, 0,
                      GL_BGRA, GL_UNSIGNED_BYTE, s_decode);
         tex_account(t, w * h * 4);
@@ -1654,7 +1677,7 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
     surf[0] = 2.0f / (float)s->w;
     surf[1] = 2.0f / (float)s->h;
     surf[2] = 1.0f / (float)zmax_of(r);
-    surf[3] = 0.0f;
+    surf[3] = 0.5f - 0.5f * (float)s->w / (float)s->pw;   /* see nv2a_snap */
     aa[0] = b->aa_sx > 0 ? b->aa_sx : 1.0f;
     aa[1] = b->aa_sy > 0 ? b->aa_sy : 1.0f;
     memcpy(m, b->composite, sizeof m);

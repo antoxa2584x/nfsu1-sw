@@ -49,6 +49,48 @@ https://github.com/antoxa2584x/nfsu1-sw (`main`, commits as
 
 ## Findings
 
+- **Car reflections = cube maps (ported from NFSU2 f0b3f1e, 2026-10-08,
+  Vulkan only):** texture mode 3 as 6-layer cube images, dynamic cubes
+  assembled from the six face surfaces (`cube_from_surfaces`), samplerCube in
+  gl_psh.c for VK only. `RECOMP_VK_CUBE=0` turns it off. Builds; not run yet.
+
+
+- **Switch perf (2026-10-08, Vulkan focus):** CPU-bound: game thread +
+  executor (decode + VK on one thread) peg two cores, GPU idle. NFSU1's
+  Present (0x1CF75B) already waits on the *previous* frame's fence (one frame
+  in flight), so NFSU2's RECOMP_FRAME_LAG does not apply (its BlockOnFence
+  0x1D1850 has one caller, 0x16EEB0, a flush-and-unbind routine); Linux race
+  main thread ~15 ms/frame in that wait = renderer side is the limit. Ring
+  space waits: 0x1D05A4. A game-drawn SZ_I8 (0x0B) 512x512 + 128x512 pair
+  changes its indices every race frame (palette fixed): ~16 ms/frame of
+  per-texel swizzle on the console; now two lookup tables (swizzle_tables,
+  GL + VK, bit-exact). Ported from NFSU2: 66b876d (VK instancing: race
+  2382 draws -> 1408 calls; off-screen batch cull, 0 mismatches, 1-3%
+  skipped) and 7691775 (clock keeper 0x2C + applet hook), plus
+  NFSU2_*_MHZ_DOCKED overrides. nfsu1x_env.txt sets RECOMP_GIL_EAGER=1.
+  Upstream xboxrecomp v0.13.x: lifter/kernel correctness only, nothing
+  for the GPU path.
+- **Console run 2026-10-08 (VK, 1785/768/1600 MHz, scale 1.5):** race
+  26-28 fps (was 13-17). nv2a_ack_thread (executor + VK) 95-100%, game
+  thread ~50% (waits on it). Its profile: pb_scan + exec_method self 33%
+  (one call per pushbuffer word; race words: VS constants 0x0B80-0x0BFC
+  ~55%, ARRAY_ELEMENT16 ~28%), our VK glue ~20%, cull_bbox 4.3% (culls
+  1-3% -> RECOMP_CULL=0 in the env file), malloc/free in Mesa's
+  BindVertexBuffers2 3.6% (STACK_ARRAY > 8), NVK ~10%. Fixed:
+  `nv2a_pb_exec_run` takes constant and index runs in one loop (skipped
+  under RECOMP_PB_SCAN, which now alone enables the survey), vertex buffers
+  bound 8 + 8, vertex input re-sent only on change, textures decoded
+  straight into the ring. Linux race frames and draw counts unchanged.
+- **Light line top/left at RECOMP_GL_SCALE > 1:** NFSU2 7d48eac ported
+  (`nv2a_snap` offset u_surf.w = 0.5 - 0.5*w/pw, GL + VK). Linux VK race at
+  2x: edge rows/columns flat. NFSU2's in-game Resolution Scale row
+  (48b1b27) is NFSU2 menu code; NFSU1 uses RECOMP_GL_SCALE in the env file.
+- **Console 2026-10-08 23:21 (all of the above):** race steady 30 fps (the
+  game's cap), executor 62-90%. Audio: NFSU2's centre/LFE/I3DL2 downmix
+  (7d48eac apu_dsp.c) ported -- engine and voice were left-only.
+  Open: main-menu car's rear window seen through the side windows (not
+  reproduced in Linux dumps; the menu camera hides the glass).
+
 - **XDK 5558 vs NFSU2's 5849:** D3D, DSOUND and the CRT are the same code
   apart from relocations; game code is not (different compiler output), so
   NFSU2's native game leaves, time cap, stream guard and text patch do not

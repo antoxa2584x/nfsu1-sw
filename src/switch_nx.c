@@ -18,6 +18,7 @@
 #include <switch.h>
 
 #include <fcntl.h>
+#include <malloc.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -251,6 +252,14 @@ static void perf_report(void)
     fprintf(stderr, "[perf] %.1f fps, textures %llu MB, %u shader programs, %s\n",
             (f - last_frames) / 10.0,
             (unsigned long long)(nv2a_gl_texture_bytes() >> 20), nv2a_gl_program_count(), vb);
+    {
+        /* A slow-down that builds up over a long session (2026-10-05:
+         * heavy stutter after ~30 min until the game is restarted) would
+         * show here as a heap that keeps growing. */
+        struct mallinfo mi = mallinfo();
+        fprintf(stderr, "[perf] heap %u MB in use, %u MB free in the arena\n",
+                (unsigned)(mi.uordblks >> 20), (unsigned)(mi.fordblks >> 20));
+    }
     /* 1500 frames/s is real time; below it, movies (clocked by DirectSound's
      * play cursor) run slow. */
     fprintf(stderr, "[perf] APU %d frames/s (1500 = real time), frame thread %.0f%% busy\n",
@@ -755,6 +764,7 @@ static void loader_start(void) { }
 #endif
 
 static int s_prof_all;          /* RECOMP_NX_PROFILE=2 */
+static u64 s_prof_after;        /* RECOMP_NX_PROFILE_AFTER=<s>: ticks since boot */
 
 /* ── Sampling profiler (RECOMP_NX_PROFILE=1) ──────────────────────────
  *
@@ -812,6 +822,10 @@ static void prof_thread(void *arg)
         u64 now;
         svcSleepThread(1000000ull);
         now = armGetSystemTick();
+        if (now - s_t0 < s_prof_after) {             /* RECOMP_NX_PROFILE_AFTER */
+            t_flush = now;
+            continue;
+        }
         if (now - t_list > freq / 10) {             /* who is busy */
             u64 span = now - t_list;
             uintptr_t entry;
@@ -887,6 +901,10 @@ static void prof_start(void)
     if (!e || (*e != '1' && *e != '2'))
         return;
     s_prof_all = *e == '2';
+    /* Sample only from <s> seconds after boot: a problem that starts late
+     * in a long session (the 1 kHz file grows ~1 MB per 10 s). */
+    if ((e = getenv("RECOMP_NX_PROFILE_AFTER")) && atoi(e) > 0)
+        s_prof_after = (u64)atoi(e) * armGetSystemTickFreq();
     /* 0x2A: above every game and host thread, so it runs on time. */
     if (R_FAILED(threadCreate(&t, prof_thread, NULL, NULL, 0x4000, 0x2A, -2))
         || R_FAILED(threadStart(&t))) {
@@ -906,14 +924,22 @@ static void prof_start(void)
  * The CPU is what limits this port: the game thread, the pushbuffer
  * executor and the GL/Vulkan thread are all CPU-bound. Through clkrst
  * (8.0.0+) or pcv, as sys-clk does; the old rates come back on exit. The
- * system resets clocks on dock/undock and after sleep, so a thread applies
- * them again every second while the game has focus. More heat and battery:
- * opt-in. sys-clk, when installed, may override them with its own profile. */
+ * system resets clocks on dock/undock, after sleep and when the game comes
+ * back from the HOME menu, so a thread applies them again every second
+ * while the game has focus, and every 250 ms for 5 s after any focus,
+ * dock or performance-mode change (applet hook). It runs at a high priority:
+ * at the lowest (0x3F) the busy guest threads (0x3B) on its core starved it
+ * and the clocks stayed at the system's after HOME. More heat and battery:
+ * opt-in. sys-clk, when installed, may override them with its own profile.
+ * NFSU2_CPU_MHZ_DOCKED / _GPU_ / _MEM_ set other rates for docked play (the
+ * plain names apply to both modes otherwise); the keeper sets the rates of
+ * the mode the console is in, so docking or undocking switches them. */
 static struct {
     const char *env, *name;
     PcvModule mod;
     PcvModuleId id;
-    u32 cap_hz, want_hz, old_hz, set_hz;
+    u32 cap_hz, want_hz[2], old_hz, set_hz[2];   /* [0] handheld, [1] docked */
+    int touched;
     int open;
     ClkrstSession s;
 } s_clk[3] = {
@@ -925,6 +951,13 @@ static int s_clk_rst = -1;                 /* 1 clkrst, 0 pcv, -1 not up */
 static volatile int s_clk_stop;
 static Thread s_clk_thread;
 static int s_clk_thread_up;
+static UEvent s_clk_wake;
+static AppletHookCookie s_clk_hook;
+
+static int clk_docked(void)
+{
+    return appletGetOperationMode() == AppletOperationMode_Console;
+}
 
 static Result clk_get(int i, u32 *hz)
 {
@@ -959,13 +992,15 @@ static void clk_restore(void)
     if (s_clk_rst < 0)
         return;
     s_clk_stop = 1;
+    appletUnhook(&s_clk_hook);
+    ueventSignal(&s_clk_wake);
     if (s_clk_thread_up) {
         threadWaitForExit(&s_clk_thread);
         threadClose(&s_clk_thread);
         s_clk_thread_up = 0;
     }
     for (i = 0; i < 3; i++)
-        if (s_clk[i].set_hz && s_clk[i].old_hz)
+        if (s_clk[i].touched && s_clk[i].old_hz)
             clk_set(i, s_clk[i].old_hz);
     for (i = 0; i < 3; i++)
         if (s_clk[i].open)
@@ -977,22 +1012,37 @@ static void clk_restore(void)
     s_clk_rst = -1;
 }
 
+/* Runs on the thread that pumps applet messages (SDL's event loop). */
+static void clk_hook(AppletHookType hook, void *param)
+{
+    (void)param;
+    if (hook == AppletHookType_OnFocusState || hook == AppletHookType_OnOperationMode
+        || hook == AppletHookType_OnPerformanceMode || hook == AppletHookType_OnResume)
+        ueventSignal(&s_clk_wake);
+}
+
 static void clk_keeper(void *arg)
 {
-    unsigned logged = 0;
+    unsigned logged = 0, fast = 0;
     (void)arg;
     while (!s_clk_stop) {
-        svcSleepThread(1000000000ull);
+        if (R_SUCCEEDED(waitSingle(waiterForUEvent(&s_clk_wake),
+                                   fast ? 250000000ull : 1000000000ull)))
+            fast = 20;
+        else if (fast)
+            fast--;
         if (s_clk_stop || appletGetFocusState() != AppletFocusState_InFocus)
             continue;
+        int m = clk_docked();
         for (int i = 0; i < 3; i++) {
-            u32 hz = 0;
-            if (!s_clk[i].set_hz || R_FAILED(clk_get(i, &hz)) || hz == s_clk[i].set_hz)
+            u32 hz = 0, want = s_clk[i].set_hz[m];
+            if (!want || R_FAILED(clk_get(i, &hz)) || hz == want)
                 continue;
-            clk_set(i, s_clk[i].set_hz);
-            if (logged++ < 8)
-                printf("[clock] %s was reset to %u MHz, back to %u MHz\n", s_clk[i].name,
-                       hz / 1000000u, s_clk[i].set_hz / 1000000u);
+            clk_set(i, want);
+            s_clk[i].touched = 1;
+            if (logged++ < 16)
+                printf("[clock] %s %s: was %u MHz, set %u MHz\n", s_clk[i].name,
+                       m ? "docked" : "handheld", hz / 1000000u, want / 1000000u);
         }
     }
 }
@@ -1001,12 +1051,19 @@ static void clk_apply(void)
 {
     int i, any = 0;
     for (i = 0; i < 3; i++) {
-        const char *e = getenv(s_clk[i].env);
-        double mhz = e ? atof(e) : 0;
-        s_clk[i].want_hz = mhz > 0 ? (u32)(mhz * 1e6 + 0.5) : 0;
-        if (s_clk[i].want_hz > s_clk[i].cap_hz)
-            s_clk[i].want_hz = s_clk[i].cap_hz;
-        any |= s_clk[i].want_hz != 0;
+        char docked[48];
+        const char *e = getenv(s_clk[i].env), *d;
+        int m;
+        snprintf(docked, sizeof docked, "%s_DOCKED", s_clk[i].env);
+        d = getenv(docked);
+        for (m = 0; m < 2; m++) {
+            const char *v = m && d ? d : e;
+            double mhz = v ? atof(v) : 0;
+            s_clk[i].want_hz[m] = mhz > 0 ? (u32)(mhz * 1e6 + 0.5) : 0;
+            if (s_clk[i].want_hz[m] > s_clk[i].cap_hz)
+                s_clk[i].want_hz[m] = s_clk[i].cap_hz;
+            any |= s_clk[i].want_hz[m] != 0;
+        }
     }
     if (!any)
         return;
@@ -1018,10 +1075,11 @@ static void clk_apply(void)
         printf("[clock] neither clkrst nor pcv is available: clocks unchanged\n");
         return;
     }
+    int mode = clk_docked();
     for (i = 0; i < 3; i++) {
         u32 hz = 0, now = 0;
         Result rc;
-        if (!s_clk[i].want_hz)
+        if (!s_clk[i].want_hz[0] && !s_clk[i].want_hz[1])
             continue;
         if (s_clk_rst) {
             if (R_FAILED(rc = clkrstOpenSession(&s_clk[i].s, s_clk[i].id, 3))) {
@@ -1031,17 +1089,24 @@ static void clk_apply(void)
             s_clk[i].open = 1;
         }
         clk_get(i, &s_clk[i].old_hz);
-        hz = clk_pick(i, s_clk[i].want_hz);
+        s_clk[i].set_hz[0] = s_clk[i].want_hz[0] ? clk_pick(i, s_clk[i].want_hz[0]) : 0;
+        s_clk[i].set_hz[1] = s_clk[i].want_hz[1] ? clk_pick(i, s_clk[i].want_hz[1]) : 0;
+        printf("[clock] %s: handheld %u MHz, docked %u MHz (0 = system's)\n", s_clk[i].name,
+               s_clk[i].set_hz[0] / 1000000u, s_clk[i].set_hz[1] / 1000000u);
+        hz = s_clk[i].set_hz[mode];
+        if (!hz)
+            continue;
         rc = clk_set(i, hz);
         clk_get(i, &now);
-        if (R_SUCCEEDED(rc))
-            s_clk[i].set_hz = now ? now : hz;
-        printf("[clock] %s %u -> %u MHz (asked %u)%s\n", s_clk[i].name,
-               s_clk[i].old_hz / 1000000u, now / 1000000u, s_clk[i].want_hz / 1000000u,
+        s_clk[i].touched = 1;
+        printf("[clock] %s %u -> %u MHz (%s)%s\n", s_clk[i].name,
+               s_clk[i].old_hz / 1000000u, now / 1000000u, mode ? "docked" : "handheld",
                R_FAILED(rc) ? " -- refused" : "");
     }
     atexit(clk_restore);
-    if (R_SUCCEEDED(threadCreate(&s_clk_thread, clk_keeper, NULL, NULL, 0x4000, 0x3F, -2))
+    ueventCreate(&s_clk_wake, true);
+    appletHook(&s_clk_hook, clk_hook, NULL);
+    if (R_SUCCEEDED(threadCreate(&s_clk_thread, clk_keeper, NULL, NULL, 0x4000, 0x2C, -2))
         && R_SUCCEEDED(threadStart(&s_clk_thread)))
         s_clk_thread_up = 1;
 }
