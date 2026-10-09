@@ -91,6 +91,18 @@ https://github.com/antoxa2584x/nfsu1-sw (`main`, commits as
   Open: main-menu car's rear window seen through the side windows (not
   reproduced in Linux dumps; the menu camera hides the glass).
 
+- **VK picture quality (2026-10-09, nv2a_vk.c):** textures had no mips
+  (maxLod 0, 1 level): distant road was grainy. Now the guest's level
+  count (format [19:16]) is honoured: DXT uploads the title's levels,
+  decoded formats get GPU blits (tex_gen_mips); samplers with MIN 3..6 are
+  trilinear + 8x anisotropic. Present is one FXAA 3.11 draw (surface
+  texels, letterbox rect) instead of the blit. RECOMP_VK_MIPS / _ANISO /
+  _FXAA; headless dumps add `_fxaa.bmp`. Linux race draw counts unchanged,
+  validation clean (headless + windowed). Not run on the console yet.
+  Then: RECOMP_GL_SCALE_X (per-axis surface scale; env file 2 x 1.5 =
+  1280x720 square pixels under Hor+; VK snap offset now per axis,
+  u_snap_y in gl_vsh.c's VK block), aniso 16x default, LOD bias -0.25,
+  dynamic reflection cubes mipmapped (gen_mips after the face blits).
 - **Hor+ 16:9 (2026-10-09, recomp_manual.c):** NFSU1 has no widescreen
   mode (only XGetVideoFlags caller 0x16EA50 tests PAL-60), so 4:3 was
   stretched. View projection sub_00018E60 (views at 0x262640 stride 0x360,
