@@ -763,6 +763,40 @@ void sub_00016050(void)
         MEM8(ENVMAP_VIEW(10 + n) + 8u) = keep[n];
 }
 
+/* ── Menu Size: full screen by default ───────────────────────
+ *
+ * Options -> Display -> Menu Size (0.84..1.0, the game's default 0.92,
+ * float at 0x295B00, kept in the profile) shrinks the front end toward
+ * the centre for TV overscan: the FE render sub_00016460 scales view 0
+ * by it. The loading screen's backdrop is about 680 wide and sits 13
+ * pixels right of centre, so at 0.92 its left edge comes on screen and a
+ * strip of the previous frame (the garage car) shows there; movies get
+ * borders. A handheld or a modern TV has no overscan, so the default is
+ * taken as 1.0: before each FE frame 0.92 becomes 1.0 unless the slider
+ * (sub_000C1860, Menu Size's row input) set it this session. */
+#define NFSU1_MENU_SIZE 0x00295B00u
+
+extern void sub_00016460_gen(void);
+extern void sub_000C1860_gen(void);
+static uint32_t s_menu_size_user;       /* bits the slider last stored */
+
+void sub_00016460(void)
+{
+    uint32_t v = MEM32(NFSU1_MENU_SIZE);
+    float f;
+
+    memcpy(&f, &v, 4);
+    if (v != s_menu_size_user && f > 0.919f && f < 0.921f)
+        MEM32(NFSU1_MENU_SIZE) = 0x3F800000u;   /* 1.0f */
+    sub_00016460_gen();
+}
+
+void sub_000C1860(void)
+{
+    sub_000C1860_gen();
+    s_menu_size_user = MEM32(NFSU1_MENU_SIZE);
+}
+
 /* ── Manual function overrides ─────────────────────────────── */
 
 /*

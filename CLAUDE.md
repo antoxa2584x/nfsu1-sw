@@ -136,6 +136,16 @@ https://github.com/antoxa2584x/nfsu1-sw (`main`, commits as
   in nfsu1x_options.txt, loaded in main.c. Pause menu's Camera is another
   screen (no rows). Linux path: Main Menu "No" -> up to Options -> a ->
   down -> a.
+- **Loading screen shifted right (fixed 2026-10-09, recomp_manual.c):** not
+  the renderer (viewport offset 0.53125 everywhere). Display -> Menu Size
+  (float 0x295B00, 0.84..1.0, default 0.92, saved in the profile at .nfs
+  +0x1D) scales the FE render (sub_00016460, view 0) toward the centre for
+  TV overscan; Loading.fng's backdrop is ~680 wide and 13 px right of
+  centre, so at 0.92 a strip of the last frame shows on the left (movies
+  got borders too). Before each FE frame 0.92 -> 1.0 unless the slider
+  (sub_000C1860) set it this session. RECOMP_POKE=0x295B00:0x3F800000
+  was the probe. sub_00011200 (also scales by it) is a fatal-error screen
+  ending in `jmp $`.
 - **EA Games Trax crash (fixed in xboxrecomp/tools/disasm/functions.py):**
   the Options menu handler sub_000C3EA0 (vtable only, in a gap) parks a
   `push edi` block after `ret 0x10` that two `je` reach; the gap-prologue
