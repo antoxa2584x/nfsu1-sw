@@ -23,11 +23,13 @@ from tools.disasm.functions import FunctionDetector  # noqa: E402
 
 
 class _Insn:
-    def __init__(self, addr, size, is_ret=False):
+    def __init__(self, addr, size, is_ret=False, jcc_to=None):
         self.address = addr
         self.size = size
         self.end_address = addr + size
         self.is_ret = is_ret
+        self.is_cond_jump = jcc_to is not None
+        self.jump_target = jcc_to
 
 
 class _Section:
@@ -116,6 +118,17 @@ class GapPrologueTest(unittest.TestCase):
         funcs = [_Func(0x00476EA0, 0x00476EB0), _Func(0x004771C0, 0x004771D0)]
         det = _detector(insns, funcs, prologues={0x00476EB0})
         self.assertFalse(det._pass_gap_prologues([]))
+
+    def test_a_conditional_branch_target_is_a_label_not_a_start(self):
+        # NFSU1 sub_000C3EA0: "je 0xC3F1C" twice, and 0xC3F1C ("push edi")
+        # follows a "ret 0x10" in the gap that handler sits in.
+        insns = [_Insn(0x000C3EB2, 6, jcc_to=0x000C3F1C),
+                 _Insn(0x000C3F19, 3, is_ret=True)]
+        funcs = [_Func(0x000C3D60, 0x000C3EA0), _Func(0x000C3FA0, 0x000C4264)]
+        det = _detector(insns, funcs, prologues={0x000C3F1C})
+        self.assertFalse(det._pass_gap_prologues([]))
+        self.assertEqual(det.added, [])
+
 
 class SehPrologueShapeTest(unittest.TestCase):
     """A function whose frame __SEH_prolog builds has no prologue to find.

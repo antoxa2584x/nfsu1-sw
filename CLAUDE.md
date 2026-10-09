@@ -119,6 +119,32 @@ https://github.com/antoxa2584x/nfsu1-sw (`main`, commits as
   HUD and FE 2D are still stretched. EAGL::ViewPort (0x179E10/0x179FB0)
   is not used for 3D. Found via VS-constant dump (WVP at c96) + RAM search
   + gdb watch; FE state via .data diff menu/loading/race.
+- **Options -> Camera rows (2026-10-09, recomp_manual.c `s_rows`):** NFSU2's
+  Video rows, on Camera (Display has 7 rows, no room). All option screens
+  are one class on MU_Options.fng; the Options menu (sub_000C3EA0) leaves
+  the sub-screen in [0x2BBB54] (0 Audio, 1 Camera, 2 Car, 3 Controller,
+  4 Display). Camera setup sub_000C2A70 is wrapped: rows 3..7 =
+  sub_000C1D30(row, data, select button) + sub_000C1E10(row, 0) arrows,
+  pad left/right go to this+0x3C+4*(row-1) (dispatch 0x000C281C, game's
+  own: sub_000C0C90), ours at int3 bytes 0x000C0C83+ via
+  recomp_lookup_manual. Texts: sub_000DD490(pkg, "OptionName_N" /
+  "OptionData_N", text) with our own guest strings (language files are
+  Huffman-packed). Car Reflections Off also clears the six EnvMap views'
+  +8 (ids 10..15, view(id) = 0x2C5F20 + id*0x60) around the race render
+  sub_00016050 (~25 fewer draws a race frame). Vulkan-only rows: scale,
+  FXAA, aniso, square (nv2a_vk.c from NFSU2 77b9a83 + FXAA_SUBPIX). Saved
+  in nfsu1x_options.txt, loaded in main.c. Pause menu's Camera is another
+  screen (no rows). Linux path: Main Menu "No" -> up to Options -> a ->
+  down -> a.
+- **EA Games Trax crash (fixed in xboxrecomp/tools/disasm/functions.py):**
+  the Options menu handler sub_000C3EA0 (vtable only, in a gap) parks a
+  `push edi` block after `ret 0x10` that two `je` reach; the gap-prologue
+  pass made it a function, so the handler ended there and its blocks at
+  0xC3F4D/0xC3F92 became "not detected" stubs: messages above 0x911C0A4B
+  (EA Trax's select) returned without the epilogue -> esi garbage in
+  sub_000DA280. jcc targets are now never gap-prologue starts (test in
+  test_gap_prologue.py); also healed 0x187A60 and 0x18A5B0. Upstream
+  candidate. Found with -DRECOMP_ABI_CHECK.
 - **XDK 5558 vs NFSU2's 5849:** D3D, DSOUND and the CRT are the same code
   apart from relocations; game code is not (different compiler output), so
   NFSU2's native game leaves, time cap, stream guard and text patch do not

@@ -31,12 +31,15 @@
  *                                    resolution, fractions allowed (1.5;
  *                                    0.5..4, default 1)
  *   RECOMP_GL_SCALE_X=<k>            horizontal scale, if not the same
+ *   RECOMP_VK_SQUARE=0               widescreen without 4/3 more columns on
+ *                                    surfaces without horizontal AA
  *   RECOMP_VK_MIPS=0                 sample level 0 only (no mip chains)
  *   RECOMP_VK_ANISO=<n>              anisotropic filtering of mipmapped
  *                                    textures (default 16; 1 = off)
  *   RECOMP_VK_LOD_BIAS=<b>           mip bias of mipmapped textures
  *                                    (default -0.25: a little sharper)
  *   RECOMP_VK_FXAA=0                 present with a plain blit, no FXAA
+ *   RECOMP_VK_FXAA_SUBPIX=<s>        FXAA sub-pixel smoothing 0..1 (0.25)
  *   RECOMP_VK_VALIDATION=1           (Linux) enable the Khronos validation layer
  *   RECOMP_VK_HEADLESS=1             (Linux) no window, no present
  */
@@ -286,10 +289,43 @@ typedef struct {
 /* RECOMP_GL_SCALE, as in nv2a_gl: only the pixels behind a surface grow, so
  * the viewport, clear rectangles, read-backs and the present blit scale and
  * nothing else does. Capped per surface by the device's image limits.
- * RECOMP_GL_SCALE_X: a different horizontal scale -- a 4:3 frame shown at
- * 16:9 (Hor+) gets square pixels with x = 4/3 y (1.5 -> 2 = 1280x720). */
-static double   s_scale = 1.0, s_scale_x = 1.0;
+ * Horizontal: s_scale times s_xratio, 1 unless RECOMP_GL_SCALE_X sets the
+ * horizontal scale outright (a game option's rescale keeps the ratio).
+ * s_square: widescreen shows the title's 640x480 at 16:9, so surfaces
+ * without horizontal AA get 4/3 more columns -- square pixels (races: 1.5x
+ * -> 1280x720). The front end's 1280x480 (aa 2x1) is wide enough already.
+ * RECOMP_VK_SQUARE=0 off; RECOMP_GL_SCALE_X overrides it. */
+static double   s_scale = 1.0, s_scale_x = 1.0, s_xratio = 1.0;
+static int      s_square, s_square_env;
+
+/* Picture options set at run time (NFSU2: Options -> Video), read by the
+ * renderer: FXAA on/off (at every present), anisotropic level 1..16 (per
+ * sampler key, capped by RECOMP_VK_ANISO and the device) and square pixels
+ * on/off (at the next flip, like nv2a_vk_scale_pct). The env switches
+ * (RECOMP_VK_FXAA=0, RECOMP_VK_SQUARE=0, ...) still force them off. */
+volatile int nv2a_vk_fxaa = 1;
+volatile int nv2a_vk_aniso = 16;
+volatile int nv2a_vk_square = 1;
 static uint32_t s_max_size = 4096;
+
+/* Render scale asked for at run time, in percent (a game option: NFSU2's
+ * Options -> Video); 0 = none, keep RECOMP_GL_SCALE. Applied at the next
+ * flip (rescale_surfaces). */
+volatile int nv2a_vk_scale_pct;
+
+/* The stored size of a w x h surface at the current scale, capped per axis
+ * by the device's image limits. */
+static void stored_size(uint32_t w, uint32_t h, uint32_t aa_sx, uint32_t *pw, uint32_t *ph)
+{
+    double kx = s_scale_x * (s_square && aa_sx <= 1 ? 4.0 / 3.0 : 1.0), ky = s_scale;
+    if (w * kx > (double)s_max_size)
+        kx = (double)s_max_size / w;
+    if (h * ky > (double)s_max_size)
+        ky = (double)s_max_size / h;
+    *pw = (uint32_t)(w * kx + 0.5); *ph = (uint32_t)(h * ky + 0.5);
+    if (!*pw) *pw = 1;
+    if (!*ph) *ph = 1;
+}
 
 /* v title pixels of a surface l wide, in the p stored pixels behind it. */
 static uint32_t to_stored(uint32_t v, uint32_t p, uint32_t l)
@@ -529,16 +565,7 @@ static VkSurf *surf_get(uint32_t va, uint32_t w, uint32_t h, uint32_t aa_sx, uin
     memset(s, 0, sizeof *s);
     s->va = va; s->w = w; s->h = h; s->used = s_frame;
     s->aa_sx = aa_sx; s->aa_sy = aa_sy;
-    {
-        double kx = s_scale_x, ky = s_scale;
-        if (w * kx > (double)s_max_size)
-            kx = (double)s_max_size / w;
-        if (h * ky > (double)s_max_size)
-            ky = (double)s_max_size / h;
-        s->pw = (uint32_t)(w * kx + 0.5); s->ph = (uint32_t)(h * ky + 0.5);
-        if (!s->pw) s->pw = 1;
-        if (!s->ph) s->ph = 1;
-    }
+    stored_size(w, h, aa_sx, &s->pw, &s->ph);
     if (!make_image(s->pw, s->ph, VK_FORMAT_B8G8R8A8_UNORM,
                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
@@ -552,6 +579,66 @@ static VkSurf *surf_get(uint32_t va, uint32_t w, uint32_t h, uint32_t aa_sx, uin
         LOGE("surface 0x%08X %ux%u (aa %ux%u, stored %ux%u)\n", va, w, h, aa_sx, aa_sy,
              s->pw, s->ph);
     return s;
+}
+
+/* A new render scale (nv2a_vk_scale_pct), at a flip, outside rendering:
+ * every surface is rebuilt at its new stored size with its pixels scaled
+ * over -- render targets the title keeps across frames (glow accumulators,
+ * reflection faces, the frame being presented) do not go black -- and the
+ * depth buffers are dropped; depth_get makes new ones on the next draw. */
+static void rescale_surfaces(double k)
+{
+    int i, copied = 0;
+
+    s_scale = k;
+    s_scale_x = k * s_xratio;
+    fprintf(stderr, "  [VK] rendering at %g x %g%s\n", s_scale_x, k,
+            s_square ? ", square pixels" : "");
+    for (i = 0; i < VK_MAX_SURF; i++) {
+        VkSurf *s = &s_surf[i];
+        VkImage img; VkImageView view; VkDeviceMemory mem;
+        VkImageBlit bl;
+        uint32_t pw, ph;
+        if (!s->image)
+            continue;
+        stored_size(s->w, s->h, s->aa_sx, &pw, &ph);
+        if (pw == s->pw && ph == s->ph)
+            continue;
+        if (!make_image(pw, ph, VK_FORMAT_B8G8R8A8_UNORM,
+                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                        VK_IMAGE_ASPECT_COLOR_BIT, &img, &view, &mem)) {
+            LOGE("surface 0x%08X %ux%u: image creation failed\n", s->va, pw, ph);
+            continue;
+        }
+        if (!copied) {
+            barrier_all();
+            copied = 1;
+        }
+        memset(&bl, 0, sizeof bl);
+        bl.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        bl.srcSubresource.layerCount = 1;
+        bl.srcOffsets[1].x = (int32_t)s->pw;
+        bl.srcOffsets[1].y = (int32_t)s->ph;
+        bl.srcOffsets[1].z = 1;
+        bl.dstSubresource = bl.srcSubresource;
+        bl.dstOffsets[1].x = (int32_t)pw;
+        bl.dstOffsets[1].y = (int32_t)ph;
+        bl.dstOffsets[1].z = 1;
+        vkCmdBlitImage(s_cb, s->image, VK_IMAGE_LAYOUT_GENERAL, img,
+                       VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
+        garbage_add(s->image, s->view, s->mem);
+        s->image = img; s->view = view; s->mem = mem;
+        s->pw = pw; s->ph = ph;
+        s->gen++;                       /* cube maps built from it refill */
+    }
+    for (i = 0; i < VK_MAX_DEPTH; i++)
+        if (s_depth[i].image) {
+            garbage_add(s_depth[i].image, s_depth[i].view, s_depth[i].mem);
+            memset(&s_depth[i], 0, sizeof s_depth[i]);
+        }
+    if (copied)
+        barrier_all();
 }
 
 static VkDepthBuf *depth_get(uint32_t va, uint32_t pw, uint32_t ph)
@@ -1117,7 +1204,7 @@ static VkImageView cube_from_surfaces(uint32_t va, uint32_t w, uint32_t h, uint3
 
 /* Samplers: wrap u, wrap v, mag, min, mipmapped. */
 typedef struct { uint32_t key; VkSampler s; } SamplerEnt;
-static SamplerEnt s_samplers[256];
+static SamplerEnt s_samplers[512];
 static int s_nsamplers;
 
 static VkSamplerAddressMode wrap_mode(uint32_t m)
@@ -1150,14 +1237,14 @@ static VkSampler sampler_get(uint32_t key)
         ci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
         ci.maxLod = VK_LOD_CLAMP_NONE;
         ci.mipLodBias = s_lod_bias;
-        if (s_aniso > 1.0f && !(key & 0x30000)) {
+        if (key >> 20) {
             ci.anisotropyEnable = VK_TRUE;
-            ci.maxAnisotropy = s_aniso;
+            ci.maxAnisotropy = (float)(key >> 20);
         }
     }
     ci.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
-    if (s_nsamplers == 256)
-        s_nsamplers = 0;                    /* never in practice: 6 x 6 x 8 keys */
+    if (s_nsamplers == 512)
+        s_nsamplers = 0;                    /* never in practice: 6 x 6 x 8 keys x levels */
     if (vkCreateSampler(s_dev, &ci, NULL, &s_samplers[s_nsamplers].s) != VK_SUCCESS)
         return VK_NULL_HANDLE;
     s_samplers[s_nsamplers].key = key;
@@ -1177,6 +1264,10 @@ static void rt_scale(uint32_t w, uint32_t h, uint32_t sw, uint32_t sh,
     if (h < lh) scale[1] *= (float)h / (float)lh;
 }
 
+/* Car reflections on/off at run time, for a game option (NFSU2: Options ->
+ * Video). Read on the executor thread at every cube stage bind. */
+volatile int nv2a_vk_cube_maps = 1;
+
 /* Stage i: its image view (a surface or a cached texture), sampler and
  * texcoord scale. Records uploads, so call it outside rendering or accept
  * that it ends the pass. */
@@ -1186,13 +1277,14 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2], VkDescriptor
     /* Texture mode CUBE_MAP: the shader declares a samplerCube (gl_psh.c),
      * so the descriptor must be a cube view whatever is bound. */
     int cube = ((regs[0x1E70 / 4] >> (5 * i)) & 0x1F) == 3;
-    /* RECOMP_VK_CUBE=0: cube stages sample the black dummy (no car
-     * reflections, the old look). */
-    static int cube_on = -1;
-    if (cube_on < 0) {
+    /* RECOMP_VK_CUBE=0, or the title's option (nv2a_vk_cube_maps): cube
+     * stages sample the black dummy (no car reflections, the old look). */
+    static int cube_env = -1;
+    if (cube_env < 0) {
         const char *e = getenv("RECOMP_VK_CUBE");
-        cube_on = !(e && *e == '0');
+        cube_env = !(e && *e == '0');
     }
+    int cube_on = cube_env && nv2a_vk_cube_maps;
     uint32_t base = (0x1B00u + (uint32_t)i * 0x40u) / 4;
     uint32_t control0 = regs[base + 3];
     uint32_t format = regs[base + 1];
@@ -1269,7 +1361,13 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2], VkDescriptor
     if (((filter >> 24) & 0xF) == 1) key |= 0x10000;
     if (minf == 1) key |= 0x20000;
     /* MIN 3..6: the *_MIPMAP_* filters. */
-    if (levels > 1 && ((minf >= 3 && minf <= 6) || (dyn_cube && minf != 1))) key |= 0x40000;
+    if (levels > 1 && ((minf >= 3 && minf <= 6) || (dyn_cube && minf != 1))) {
+        int an = nv2a_vk_aniso;
+        key |= 0x40000;
+        if (an > (int)s_aniso) an = (int)s_aniso;
+        if (an > 1 && !(key & 0x30000))
+            key |= (uint32_t)an << 20;          /* bits 20..24: anisotropy */
+    }
     out->sampler = sampler_get(key);
 }
 
@@ -2156,12 +2254,19 @@ static int ready(void)
         s_max_size = m ? m : 4096;
         if (!(k > 0.0)) k = 1.0;                    /* unset, 0 or garbage */
         s_scale = k < 0.5 ? 0.5 : k > 4.0 ? 4.0 : k;
+        e = getenv("RECOMP_VK_SQUARE");
+        s_square_env = xbox_video_widescreen() && !(e && *e == '0');
         e = getenv("RECOMP_GL_SCALE_X");
         k = e ? strtod(e, NULL) : 0.0;
-        s_scale_x = !(k > 0.0) ? s_scale : k < 0.5 ? 0.5 : k > 4.0 ? 4.0 : k;
-        if (s_scale != 1.0 || s_scale_x != 1.0)
-            fprintf(stderr, "  [VK] rendering at %g x %g (RECOMP_GL_SCALE[_X]), surfaces up to %u\n",
-                    s_scale_x, s_scale, s_max_size);
+        if (k > 0.0)
+            s_square_env = 0;
+        s_square = s_square_env && nv2a_vk_square;
+        if (k > 0.0)
+            s_xratio = (k < 0.5 ? 0.5 : k > 4.0 * 4.0 / 3.0 ? 4.0 * 4.0 / 3.0 : k) / s_scale;
+        s_scale_x = s_scale * s_xratio;
+        if (s_scale != 1.0 || s_scale_x != 1.0 || s_square)
+            fprintf(stderr, "  [VK] rendering at %g x %g (RECOMP_GL_SCALE[_X])%s, surfaces up to %u\n",
+                    s_scale_x, s_scale, s_square ? ", square pixels" : "", s_max_size);
     }
     if (s_ubo_align < 16) s_ubo_align = 16;
     vkGetPhysicalDeviceMemoryProperties(s_pd, &s_memprops);
@@ -3360,6 +3465,10 @@ static void dump_surface(VkSurf *s, const char *path)
  * preset, 8 search steps) worked out in the surface's texels: a fixed GPU
  * cost per frame, no draws or CPU work added. */
 static int s_fxaa = -1;
+/* RECOMP_VK_FXAA_SUBPIX: FXAA's sub-pixel smoothing, 0..1. FXAA's own 0.75
+ * blurred text (HUD, number plates); 0.25 keeps it and still smooths
+ * edges. */
+static float s_fxaa_subpix = 0.25f;
 static VkDescriptorSetLayout s_pp_dsl;
 static VkPipelineLayout      s_pp_layout;
 static VkSampler             s_pp_sampler;
@@ -3426,7 +3535,7 @@ static const char s_pp_fs[] =
     "    float la = (1.0 / 12.0) * (2.0 * (lDU + lLR) + lLc + lRc);\n"
     "    float s1 = clamp(abs(la - lM) / range, 0.0, 1.0);\n"
     "    float s2 = (-2.0 * s1 + 3.0) * s1 * s1;\n"
-    "    fin = max(fin, s2 * s2 * 0.75);\n"
+    "    fin = max(fin, s2 * s2 * pc.rcp.z);\n"
     "    if (hor) uv.y += fin * step; else uv.x += fin * step;\n"
     "    o = vec4(textureLod(src, uv, 0.0).rgb, 1.0);\n"
     "}\n";
@@ -3436,8 +3545,13 @@ static int fxaa_on(void)
     if (s_fxaa < 0) {
         const char *e = getenv("RECOMP_VK_FXAA");
         s_fxaa = !(e && *e == '0');
+        e = getenv("RECOMP_VK_FXAA_SUBPIX");
+        if (e)
+            s_fxaa_subpix = (float)atof(e);
+        if (!(s_fxaa_subpix >= 0.0f)) s_fxaa_subpix = 0.0f;
+        if (s_fxaa_subpix > 1.0f) s_fxaa_subpix = 1.0f;
     }
-    return s_fxaa;
+    return s_fxaa && nv2a_vk_fxaa;
 }
 
 static VkPipeline pp_pipe(VkFormat fmt)
@@ -3590,7 +3704,8 @@ static int present_fxaa(VkSurf *s, VkImage dst, VkImageView dview, VkFormat fmt,
     wr.pImageInfo = &ii;
     p_push_desc(s_cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pp_layout, 0, 1, &wr);
     pc[0] = (float)dx; pc[1] = (float)dy; pc[2] = (float)dw; pc[3] = (float)dh;
-    pc[4] = 1.0f / (float)s->pw; pc[5] = 1.0f / (float)s->ph; pc[6] = pc[7] = 0.0f;
+    pc[4] = 1.0f / (float)s->pw; pc[5] = 1.0f / (float)s->ph;
+    pc[6] = s_fxaa_subpix; pc[7] = 0.0f;
     vkCmdPushConstants(s_cb, s_pp_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, pc);
     vkCmdDraw(s_cb, 3, 1, 0, 0);
     p_end_rendering(s_cb);
@@ -3721,6 +3836,17 @@ static void vk_flip(void)
     end_rendering();
     s_rt = NULL;
     s_rt_depth = NULL;
+    {
+        int pct = nv2a_vk_scale_pct;
+        double k = pct < 50 ? 0.0 : pct > 400 ? 4.0 : pct / 100.0;
+        int sq = s_square_env && nv2a_vk_square;
+        if (!(k > 0.0))
+            k = s_scale;
+        if (k != s_scale || sq != s_square) {
+            s_square = sq;
+            rescale_surfaces(k);
+        }
+    }
     if (s && s_drew_any && dump_every && ((s_frame % (uint32_t)dump_every) == 0
                                           || (s_inst_alt && s_frame % (uint32_t)dump_every == 1))) {
         char path[320];

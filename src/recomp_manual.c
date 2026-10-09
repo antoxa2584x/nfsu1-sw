@@ -431,6 +431,338 @@ void sub_00018E40(void)
     sub_00018E40_gen();
 }
 
+/* ── Options -> Camera: car reflections and picture rows ──────
+ *
+ * The port's own settings, as NFSU2 has them under Options -> Video, live
+ * on the Camera screen: Display already has seven rows and no room for
+ * more, Camera has two (Favorite Drive Camera, Jump Cameras).
+ *
+ * All option screens are one class on MU_Options.fng; the Options menu
+ * leaves the chosen one in [0x2BBB54] (1 = Camera) and the screen calls
+ * its setup: sub_000C2A70 for Camera. A row N (1..10) is the package's
+ * OptionName_N / OptionData_N / LeftArrow_N / RightArrow_N objects:
+ * sub_000C1D30(N, data, select button) shows it and makes it selectable,
+ * sub_000C1E10(N, 0) adds the arrows. Pad left/right on a row call
+ * this+0x3C+4*(N-1) (thiscall, the message, ret 4; dispatch at
+ * 0x000C281C), Favorite Drive Camera's being sub_000C0C90: step a value,
+ * rewrite the texts with sub_000DD490(package, object name, text) and
+ * play the arrow sound (sub_000DDDE0 / sub_000DDD60). Rows 3..7 are added
+ * the same way after the original setup; their handlers are our own, at
+ * unused int3 bytes after sub_000C0C20 (ROW_HANDLER_VA, recomp_lookup_manual).
+ * Texts are our own strings in guest memory -- the language files are
+ * Huffman-packed, and dd490 takes any text.
+ *
+ * Car Reflections Off: the Vulkan renderer's cube stages sample black
+ * (nv2a_vk_cube_maps; the GL renderer never drew them) and the race
+ * renderer sub_00016050 skips the six "EnvMap %d" cube-face views (ids
+ * 10..15, view(id) = 0x2C5F20 + id*0x60, drawn only while byte +8 is set):
+ * the bytes are cleared for the call and put back after it.
+ *
+ * Vulkan build only: Resolution Scale 1x/1.5x/2x/2.5x (nv2a_vk_scale_pct,
+ * applied at the next flip; without a saved value RECOMP_GL_SCALE rules
+ * and the row shows the nearest step), Anti-Aliasing = FXAA
+ * (nv2a_vk_fxaa), Anisotropic Off..16x (nv2a_vk_aniso), Square Pixels
+ * (nv2a_vk_square: 4/3 the columns in 16:9). The renderer's env switches
+ * still force each off.
+ *
+ * Kept in nfsu1x_options.txt (sdmc:/switch/nfsu1x/ on the Switch, the
+ * working directory elsewhere), not in the profile; loaded at boot
+ * (nfsu1_options_load, main.c). */
+#ifdef __SWITCH__
+#  define NFSU1_OPTIONS_FILE "sdmc:/switch/nfsu1x/nfsu1x_options.txt"
+#else
+#  define NFSU1_OPTIONS_FILE "nfsu1x_options.txt"
+#endif
+#define FE_PAD_LEFT     0x9120409Eu
+#define FE_PAD_RIGHT    0xB5971BF1u
+#define ROW_HANDLER_VA  0x000C0C83u     /* + row index: int3 padding */
+#define ROW_FIRST       3               /* rows 1-2 are the game's */
+#define ENVMAP_VIEW(id) (0x002C5F20u + (uint32_t)(id) * 0x60u)
+
+#ifdef NFSU2_VULKAN
+extern volatile int nv2a_vk_cube_maps;
+extern volatile int nv2a_vk_scale_pct;
+extern volatile int nv2a_vk_fxaa;
+extern volatile int nv2a_vk_aniso;
+extern volatile int nv2a_vk_square;
+#endif
+extern uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment);
+extern void sub_000C2A70_gen(void);
+extern void sub_00016050_gen(void);
+
+static const int s_scale_pct[] = { 100, 150, 200, 250 };
+static const int s_aniso_lvl[] = { 1, 2, 4, 8, 16 };
+
+static int s_refl = 1;                  /* 0 off, 1 on */
+static int s_scale_idx = 1;             /* into s_scale_pct: 1.5x */
+static int s_scale_saved;               /* nfsu1x_options.txt had scale= */
+static int s_fxaa = 1;                  /* 0 off, 1 on */
+static int s_aniso_idx = 4;             /* into s_aniso_lvl: 16x */
+static int s_square = 1;                /* 0 off, 1 on */
+
+typedef struct {
+    const char *label;
+    const char *const *texts;
+    int n;
+    int *value;
+    void (*changed)(void);
+} OptRow;
+
+static void refl_changed(void)
+{
+#ifdef NFSU2_VULKAN
+    nv2a_vk_cube_maps = s_refl;
+#endif
+}
+
+#ifdef NFSU2_VULKAN
+static void scale_changed(void)
+{
+    nv2a_vk_scale_pct = s_scale_pct[s_scale_idx];
+    s_scale_saved = 1;
+}
+
+static void picture_changed(void)
+{
+    nv2a_vk_fxaa = s_fxaa;
+    nv2a_vk_aniso = s_aniso_lvl[s_aniso_idx];
+    nv2a_vk_square = s_square;
+}
+#endif
+
+static const char *const s_onoff[] = { "Off", "On" };
+#ifdef NFSU2_VULKAN
+static const char *const s_scale_texts[] = { "1x", "1.5x", "2x", "2.5x" };
+static const char *const s_aniso_texts[] = { "Off", "2x", "4x", "8x", "16x" };
+#endif
+static const OptRow s_rows[] = {
+    { "Car Reflections:", s_onoff, 2, &s_refl, refl_changed },
+#ifdef NFSU2_VULKAN
+    { "Resolution Scale:", s_scale_texts, 4, &s_scale_idx, scale_changed },
+    { "Anti-Aliasing:", s_onoff, 2, &s_fxaa, picture_changed },
+    { "Anisotropic:", s_aniso_texts, 5, &s_aniso_idx, picture_changed },
+    { "Square Pixels:", s_onoff, 2, &s_square, picture_changed },
+#endif
+};
+#define N_ROWS ((int)(sizeof s_rows / sizeof s_rows[0]))
+
+static void options_log(void)
+{
+#ifdef NFSU2_VULKAN
+    fprintf(stderr, "[options] car reflections %s, resolution scale %d%%%s, anti-aliasing %s,"
+            " anisotropic %dx, square pixels %s\n",
+            s_refl ? "on" : "off", s_scale_pct[s_scale_idx],
+            nv2a_vk_scale_pct ? "" : " (RECOMP_GL_SCALE)", s_fxaa ? "on" : "off",
+            s_aniso_lvl[s_aniso_idx], s_square ? "on" : "off");
+#else
+    fprintf(stderr, "[options] car reflections %s\n", s_refl ? "on" : "off");
+#endif
+}
+
+void nfsu1_options_load(void)
+{
+    char line[128];
+    FILE *f = fopen(NFSU1_OPTIONS_FILE, "r");
+    int i;
+
+    if (f) {
+        while (fgets(line, sizeof line, f)) {
+            if (!strncmp(line, "reflections=", 12))
+                s_refl = line[12] != '0';
+            else if (!strncmp(line, "fxaa=", 5))
+                s_fxaa = line[5] != '0';
+            else if (!strncmp(line, "square=", 7))
+                s_square = line[7] != '0';
+            else if (!strncmp(line, "aniso=", 6)) {
+                int a = atoi(line + 6);
+                for (i = 0; i < 5; i++)
+                    if (s_aniso_lvl[i] == a)
+                        s_aniso_idx = i;
+            }
+            else if (!strncmp(line, "scale=", 6)) {
+                int pct = atoi(line + 6);
+                for (i = 0; i < 4; i++)
+                    if (s_scale_pct[i] == pct) {
+                        s_scale_idx = i;
+                        s_scale_saved = 1;
+                    }
+            }
+        }
+        fclose(f);
+    }
+    refl_changed();
+#ifdef NFSU2_VULKAN
+    {
+        const char *e = getenv("RECOMP_GL_SCALE");
+        if (!s_scale_saved && e && *e) {
+            /* RECOMP_GL_SCALE stays in charge until the option is changed;
+             * the row shows the nearest step. */
+            double k = strtod(e, NULL), best = 1e9;
+            for (i = 0; i < 4; i++) {
+                double d = fabs(k * 100.0 - s_scale_pct[i]);
+                if (d < best) { best = d; s_scale_idx = i; }
+            }
+        } else {
+            nv2a_vk_scale_pct = s_scale_pct[s_scale_idx];
+        }
+    }
+    picture_changed();
+#endif
+    options_log();
+}
+
+static void options_save(void)
+{
+    FILE *f = fopen(NFSU1_OPTIONS_FILE, "w");
+    if (!f) {
+        fprintf(stderr, "[options] cannot write " NFSU1_OPTIONS_FILE "\n");
+        return;
+    }
+    fprintf(f, "reflections=%d\n", s_refl);
+    if (s_scale_saved)
+        fprintf(f, "scale=%d\n", s_scale_pct[s_scale_idx]);
+#ifdef NFSU2_VULKAN
+    fprintf(f, "fxaa=%d\naniso=%d\nsquare=%d\n", s_fxaa, s_aniso_lvl[s_aniso_idx], s_square);
+#endif
+    fclose(f);
+}
+
+/* Our texts in guest memory, each copied once. */
+static uint32_t guest_str(const char *s)
+{
+    static struct { const char *s; uint32_t va; } cache[32];
+    static uint32_t pool, used;
+    size_t n = strlen(s) + 1;
+    int i;
+
+    for (i = 0; i < 32 && cache[i].s; i++)
+        if (cache[i].s == s)
+            return cache[i].va;
+    if (i == 32)
+        return 0;
+    if (!pool) {
+        pool = xbox_ContiguousAlloc(0x400u, 16);
+        if (!pool)
+            return 0;
+    }
+    if (used + n > 0x400u)
+        return 0;
+    memcpy((void *)XBOX_PTR(pool + used), s, n);
+    cache[i].s = s;
+    cache[i].va = pool + used;
+    used += (uint32_t)n;
+    return cache[i].va;
+}
+
+/* sub_000DD490(package, object name, text), cdecl. */
+static void fe_set_text(uint32_t screen, const char *object, const char *text)
+{
+    uint32_t name = guest_str(object), str = guest_str(text);
+
+    if (!name || !str)
+        return;
+    PUSH32(esp, str);
+    PUSH32(esp, name);
+    PUSH32(esp, MEM32(screen + 0xCu));
+    PUSH32(esp, ROW_HANDLER_VA);
+    sub_000DD490();
+    esp += 12;
+}
+
+static const char *const s_name_obj[] = {
+    "OptionName_3", "OptionName_4", "OptionName_5", "OptionName_6", "OptionName_7",
+};
+static const char *const s_data_obj[] = {
+    "OptionData_3", "OptionData_4", "OptionData_5", "OptionData_6", "OptionData_7",
+};
+
+static void opt_row_text(uint32_t screen, int i)
+{
+    fe_set_text(screen, s_name_obj[i], s_rows[i].label);
+    fe_set_text(screen, s_data_obj[i], s_rows[i].texts[*s_rows[i].value]);
+}
+
+/* Camera setup (thiscall, ecx = options screen, ret): the game's two rows,
+ * then ours. */
+void sub_000C2A70(void)
+{
+    uint32_t screen = ecx;
+    int i;
+
+    sub_000C2A70_gen();
+    for (i = 0; i < N_ROWS; i++) {
+        int row = ROW_FIRST + i;
+        PUSH32(esp, 0);                     /* no select button */
+        PUSH32(esp, 1);                     /* value text */
+        PUSH32(esp, (uint32_t)row);
+        ecx = screen;
+        PUSH32(esp, 0x000C2A99u);
+        sub_000C1D30();                     /* thiscall, pops its 3 */
+        PUSH32(esp, 0);                     /* arrows, not -/+ */
+        PUSH32(esp, (uint32_t)row);
+        ecx = screen;
+        PUSH32(esp, 0x000C2AB3u);
+        sub_000C1E10();                     /* thiscall, pops its 2 */
+        MEM32(screen + 0x3Cu + 4u * (uint32_t)(row - 1)) = ROW_HANDLER_VA + (uint32_t)i;
+        opt_row_text(screen, i);
+    }
+}
+
+/* Row input (thiscall, the message, ret 4), as sub_000C0C90: left/right
+ * step the value (wrapping), then the texts and the arrow sound. */
+static void opt_row_input(int i)
+{
+    uint32_t screen = ecx, msg = MEM32(esp + 4);
+    const OptRow *o = &s_rows[i];
+
+    if (msg == FE_PAD_LEFT || msg == FE_PAD_RIGHT) {
+        *o->value = (*o->value + (msg == FE_PAD_RIGHT ? 1 : o->n - 1)) % o->n;
+        o->changed();
+        options_save();
+        options_log();
+        opt_row_text(screen, i);
+        PUSH32(esp, 0xBu);
+        PUSH32(esp, 0xAu);
+        PUSH32(esp, msg);
+        PUSH32(esp, ROW_HANDLER_VA);
+        sub_000DDDE0();
+        esp += 12;
+        PUSH32(esp, eax);
+        PUSH32(esp, MEM32(screen + 0xCu));
+        PUSH32(esp, ROW_HANDLER_VA);
+        sub_000DDD60();
+        esp += 8;
+    }
+    esp += 8;
+}
+
+static void opt_row_input_0(void) { opt_row_input(0); }
+#ifdef NFSU2_VULKAN
+static void opt_row_input_1(void) { opt_row_input(1); }
+static void opt_row_input_2(void) { opt_row_input(2); }
+static void opt_row_input_3(void) { opt_row_input(3); }
+static void opt_row_input_4(void) { opt_row_input(4); }
+#endif
+
+/* Race render (cdecl, no arguments): cube-face views off for the call. */
+void sub_00016050(void)
+{
+    uint8_t keep[6];
+    int n;
+
+    if (s_refl) {
+        sub_00016050_gen();
+        return;
+    }
+    for (n = 0; n < 6; n++) {
+        keep[n] = MEM8(ENVMAP_VIEW(10 + n) + 8u);
+        MEM8(ENVMAP_VIEW(10 + n) + 8u) = 0;
+    }
+    sub_00016050_gen();
+    for (n = 0; n < 6; n++)
+        MEM8(ENVMAP_VIEW(10 + n) + 8u) = keep[n];
+}
+
 /* ── Manual function overrides ─────────────────────────────── */
 
 /*
@@ -477,7 +809,15 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
      * if (xbox_va == 0x000ABCDE) return fixed_sub_000ABCDE;
      */
 
-    (void)xbox_va;
+    if (xbox_va - ROW_HANDLER_VA < (uint32_t)N_ROWS) {
+        static const recomp_func_t row_input[] = {
+            opt_row_input_0,
+#ifdef NFSU2_VULKAN
+            opt_row_input_1, opt_row_input_2, opt_row_input_3, opt_row_input_4,
+#endif
+        };
+        return row_input[xbox_va - ROW_HANDLER_VA];
+    }
     return (recomp_func_t)0;
 }
 

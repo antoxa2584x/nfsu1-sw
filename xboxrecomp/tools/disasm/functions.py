@@ -200,6 +200,16 @@ class FunctionDetector:
             i = bisect.bisect_right(starts, addr) - 1
             return not (i >= 0 and addr < bounds[i][1])
 
+        # A conditional branch lands on a label of its own function, never on
+        # another function's start. NFSU1's sub_000C3EA0, a screen's message
+        # handler reached only through its vtable, sits in a gap and parks a
+        # "push edi" block after a "ret 0x10" that two of its je's reach;
+        # taken for a start, it cut the handler short and left the blocks
+        # past it as stubs, so every pad message unbalanced the stack.
+        jcc_targets = {insn.jump_target
+                       for insn in self.engine.instructions.values()
+                       if getattr(insn, "is_cond_jump", False)}
+
         added = False
         for insn in list(self.engine.instructions.values()):
             if not insn.is_ret:
@@ -207,6 +217,8 @@ class FunctionDetector:
             nxt = insn.end_address
             if nxt in self._candidates or nxt in self.functions:
                 continue
+            if nxt in jcc_targets:
+                continue                    # a label, not a start
             section = self.image.get_section_at_va(nxt)
             if section is None or not section.executable:
                 continue

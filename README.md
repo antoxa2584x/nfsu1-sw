@@ -11,7 +11,7 @@ instruction by instruction to C and running natively, with no emulator.
 ![Linux](https://img.shields.io/badge/Linux-x86__64-FCC624?logo=linux&logoColor=black)
 ![Vulkan](https://img.shields.io/badge/Vulkan-1.3-AC162C?logo=vulkan&logoColor=white)
 ![OpenGL](https://img.shields.io/badge/OpenGL-renderer-5586A4?logo=opengl&logoColor=white)
-![Version](https://img.shields.io/badge/version-0.2.5-blue)
+![Version](https://img.shields.io/badge/version-0.3-blue)
 
 [Features](#-features) · [Playing on Switch](#-playing-on-switch) · [Building](#%EF%B8%8F-building) · [Configuration](#%EF%B8%8F-configuration) · [Status](#-status)
 
@@ -31,9 +31,15 @@ instruction by instruction to C and running natively, with no emulator.
   render scaling up to 4x
 - ⚡ **30 fps races on Switch** (the game's own cap) with the Vulkan build
   and raised clocks
-- 🪞 **Car reflections** as cube maps (Vulkan)
+- 🪞 **Car reflections** as cube maps (Vulkan), switchable in
+  **Options → Camera → Car Reflections**; Off also skips the reflection
+  cube-face passes in races
 - 🖼️ **Cleaner picture** (Vulkan): mipmaps with trilinear and 16x
   anisotropic filtering, FXAA, square-pixel 1280x720 for the 16:9 view
+- ⚙️ **Graphics options in the game** (Vulkan), under **Options → Camera**:
+  Resolution Scale (1x, 1.5x, 2x, 2.5x), Anti-Aliasing, Anisotropic
+  (Off-16x) and Square Pixels, applied at once and kept in
+  `nfsu1x_options.txt`
 - 🎬 **Movies** played by the game's own EA `.mad` decoder
 - 🔊 **Audio** through an emulated Xbox APU, with 5.1 downmixed to stereo
 - 📳 **Rumble** on Switch HD rumble and SDL controllers
@@ -54,6 +60,7 @@ instruction by instruction to C and running natively, with no emulator.
 sdmc:/switch/nfsu1x/
 ├── nfsu1x-vulkan.nro
 ├── nfsu1x_env.txt      optional settings, KEY=VALUE per line
+├── nfsu1x_options.txt  written by the in-game options the port adds
 ├── save/               created on first run
 └── game/
     ├── default.xbe
@@ -70,7 +77,6 @@ Recommended `nfsu1x_env.txt`:
 RECOMP_GIL_EAGER=1
 RECOMP_CULL=0
 RECOMP_GL_SCALE=1.5
-RECOMP_GL_SCALE_X=2
 NFSU2_CPU_MHZ=1785
 NFSU2_GPU_MHZ=768
 ```
@@ -154,13 +160,13 @@ lists every runtime switch; the ones that matter here:
 
 | Variable | Meaning |
 |---|---|
-| `RECOMP_GL_SCALE` | Render resolution multiple, 0.5..4 (fractions allowed). |
-| `RECOMP_GL_SCALE_X` | Vulkan: horizontal multiple, if different (4/3 of `RECOMP_GL_SCALE` = square pixels at 16:9). |
+| `RECOMP_GL_SCALE` | Render resolution multiple, 0.5..4 (fractions allowed). Vulkan: only until Options → Camera → Resolution Scale is changed (default there 1.5x). |
+| `RECOMP_GL_SCALE_X` | Vulkan: horizontal multiple, if different; overrides Square Pixels. |
 | `RECOMP_VK_MIPS=0` | Vulkan: no mipmaps (distant textures shimmer, the old look). |
 | `RECOMP_VK_ANISO` | Vulkan: anisotropic filtering, 1..16 (default 16; 1 = off). |
 | `RECOMP_VK_LOD_BIAS` | Vulkan: mip bias, negative = sharper (default -0.25). |
 | `RECOMP_VK_FXAA=0` | Vulkan: no FXAA (plain scaled blit to the screen). |
-| `RECOMP_VK_CUBE=0` | Vulkan: no cube maps (car reflections off). |
+| `RECOMP_VK_CUBE=0` | Vulkan: no cube maps (car reflections off), whatever Options → Camera says. |
 | `RECOMP_GL_DXT=0` | Decode DXT textures on the CPU instead of uploading them compressed. |
 | `RECOMP_GL_TEX_MB` | Texture cache budget in MB. |
 | `RECOMP_PROG_CACHE` | Shader/pipeline cache file (`progcache.bin`), `=0` off. |
