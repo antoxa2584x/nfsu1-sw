@@ -375,6 +375,67 @@ static void pad_script(int dev, uint8_t *digital, uint8_t *analog)
     }
     if (s_script_count[dev] < 0)
         pad_script_parse(dev);
+    /* RECOMP_PAD_CMD=<file>: "buttons:hold_ms" written there is pressed
+     * now and the file removed -- drives pad 1 live from a shell. */
+    if (!dev) {
+        static const char *cmd = (const char *)1;
+        static unsigned long live_until;
+        static uint8_t live_dig, live_ana;
+        static unsigned long checked;
+        if (cmd == (const char *)1)
+            cmd = getenv("RECOMP_PAD_CMD");
+        if (cmd && now - checked >= 50) {
+            FILE *f = fopen(cmd, "r");
+            checked = now;
+            if (f) {
+                char line[128] = "";
+                if (fgets(line, sizeof line, f)) {
+                    char *nl = strpbrk(line, "\r\n");
+                    if (nl)
+                        *nl = 0;
+                    {
+                        /* tiny local parse: buttons joined with '+', then :hold */
+                        static const struct { const char *n; uint8_t d, a; } nm[] = {
+                            { "up", 0x01, 0 }, { "down", 0x02, 0 }, { "left", 0x04, 0 },
+                            { "right", 0x08, 0 }, { "start", 0x10, 0 }, { "back", 0x20, 0 },
+                            { "a", 0, 0x01 }, { "b", 0, 0x02 }, { "x", 0, 0x04 }, { "y", 0, 0x08 },
+                            { "black", 0, 0x10 }, { "white", 0, 0x20 }, { "lt", 0, 0x40 },
+                            { "rt", 0, 0x80 },
+                        };
+                        char *p = line, *colon = strchr(line, ':');
+                        unsigned hold = colon ? (unsigned)strtoul(colon + 1, NULL, 10) : 200;
+                        size_t k;
+                        if (colon)
+                            *colon = 0;
+                        live_dig = live_ana = 0;
+                        while (*p) {
+                            size_t len = strcspn(p, "+");
+                            for (k = 0; k < sizeof nm / sizeof nm[0]; k++)
+                                if (strlen(nm[k].n) == len && !strncmp(nm[k].n, p, len)) {
+                                    live_dig |= nm[k].d;
+                                    live_ana |= nm[k].a;
+                                }
+                            p += len;
+                            if (*p == '+')
+                                p++;
+                        }
+                        live_until = now + hold;
+                        fprintf(stderr, "  PAD1: live %s for %u ms\n", line, hold);
+                        fflush(stderr);
+                    }
+                }
+                fclose(f);
+                remove(cmd);
+            }
+        }
+        if (cmd && now < live_until) {
+            int b;
+            *digital |= live_dig;
+            for (b = 0; b < 8; b++)
+                if (live_ana & (1u << b))
+                    analog[b] = 0xFF;
+        }
+    }
     if (!s_script_count[dev])
         return;
     now -= s_script_t0;

@@ -18,5 +18,17 @@
  {
   "start": "0x001EFCB2",
   "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x000F9D90",
+  "note": "Async-read completion thunk (mov ecx,[esp+4]; jmp 0xF9CC0) pushed by 0xF9E72; missed at runtime after a race -> loader dead, main thread hung in 0x1451B0."
+ },
+ {
+  "start": "0x00184BC0",
+  "note": "Callback stored by address (MEM32(esi) = 0x184BC0); not reached by the static pass."
+ },
+ {
+  "start": "0x001ABB40",
+  "note": "Callback stored at 0x2DDCF4; not reached by the static pass."
  }
 ]

@@ -343,6 +343,94 @@ void sub_001EA5B2(void)
     esp += 4;
 }
 
+/* Hor+ 16:9. NFSU1 has no widescreen mode (its only XGetVideoFlags caller,
+ * 0x16EA50, reads the PAL-60 bit), so with the TV reported 16:9 the
+ * presenter stretched the 4:3 picture. The view projection (sub_00018E60,
+ * thiscall: ecx = the view's matrix block, arg = the view) builds
+ *   m00 = cot(fov/2), m11 = cot(fov * H/W / 2)
+ * from the render target's size, then sub_00018E40 forms view*proj, and the
+ * frustum planes are taken from that product. Scaling m00 by 3/4 just
+ * before the product widens the picture to 16:9 at the same vertical FOV,
+ * culling included. Only 4:3 targets (race 640x480, its 320x240 copy, the
+ * front end): the 128x128 environment-map faces stay square.
+ * RECOMP_HORPLUS=0 restores the stretched 4:3 picture. */
+extern int xbox_video_widescreen(void);
+extern void sub_00018E60_gen(void);
+extern void sub_00018E40_gen(void);
+static uint32_t s_proj_view;
+
+static int horplus_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_HORPLUS");
+        on = xbox_video_widescreen() && !(e && e[0] == '0');
+    }
+    return on;
+}
+
+void sub_00018E60(void)
+{
+    s_proj_view = MEM32(esp + 4);
+    sub_00018E60_gen();
+    s_proj_view = 0;
+}
+
+/* Game flow state: 3 in the front end, 4 loading, 6 racing (the game
+ * itself tests `cmp [0x283434], 3`). */
+#define NFSU1_GAMEFLOW_STATE 0x00283434u
+
+void sub_00018E40(void)
+{
+    uint32_t v = s_proj_view;
+    int fe;
+
+    if (!v || MEM32(esp) != 0x0001902Au) {
+        sub_00018E40_gen();
+        return;
+    }
+    fe = MEM32(NFSU1_GAMEFLOW_STATE) == 3;
+
+    if (horplus_on()) {
+        uint32_t rt = MEM32(v + 0x58);
+        uint32_t w = rt ? MEM32(rt + 0x1C) : 0, h = rt ? MEM32(rt + 0x20) : 0;
+        if (w && w * 3 == h * 4) {
+            /* The front end zooms instead (m11 x 4/3): its garage set
+             * ends just past the 4:3 frame -- the tunnel mouth on the
+             * right -- so it keeps the original width, minus top and
+             * bottom. */
+            uint32_t at = ecx + (fe ? 0x54 : 0x40);   /* m11 : m00 */
+            float m;
+            memcpy(&m, (void *)XBOX_PTR(at), 4);
+            m *= fe ? 4.0f / 3.0f : 0.75f;
+            memcpy((void *)XBOX_PTR(at), &m, 4);
+        }
+    }
+    /* Front-end garage camera (views 1 and 4 share it) turned left by
+     * RECOMP_FE_YAW degrees (default 5): rows 0 and 2 of the view matrix
+     * at ecx (row-major, column vectors, eye +z forward) rotated about
+     * the eye's y axis. sub_00018E60 copies the camera in afresh. */
+    if (fe && (MEM32(v + 4) == 1 || MEM32(v + 4) == 4)) {
+        static float yaw = -1000.0f;
+        if (yaw == -1000.0f) {
+            const char *e = getenv("RECOMP_FE_YAW");
+            yaw = (e ? (float)atof(e) : 5.0f) * 3.14159265f / 180.0f;
+        }
+        if (yaw != 0.0f) {
+            float m[16], c = cosf(yaw), s = sinf(yaw);
+            int j;
+            memcpy(m, (void *)XBOX_PTR(ecx), sizeof m);
+            for (j = 0; j < 4; j++) {
+                float r0 = m[j], r2 = m[8 + j];
+                m[j]     = c * r0 + s * r2;
+                m[8 + j] = -s * r0 + c * r2;
+            }
+            memcpy((void *)XBOX_PTR(ecx), m, sizeof m);
+        }
+    }
+    sub_00018E40_gen();
+}
+
 /* ── Manual function overrides ─────────────────────────────── */
 
 /*

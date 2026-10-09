@@ -91,6 +91,22 @@ https://github.com/antoxa2584x/nfsu1-sw (`main`, commits as
   Open: main-menu car's rear window seen through the side windows (not
   reproduced in Linux dumps; the menu camera hides the glass).
 
+- **Hor+ 16:9 (2026-10-09, recomp_manual.c):** NFSU1 has no widescreen
+  mode (only XGetVideoFlags caller 0x16EA50 tests PAL-60), so 4:3 was
+  stretched. View projection sub_00018E60 (views at 0x262640 stride 0x360,
+  proj +0x1F0; m00 = cot(fov/2), m11 = cot(fov*H/W/2)) -> sub_00018E40
+  view*proj -> frustum planes from the product. Wrappers scale m00 by 3/4
+  before the product for 4:3 targets (race id 1 640x480, id 4 320x240,
+  id 8, FE id 0; env faces ids 10-15 128x128 untouched). Culling follows.
+  `RECOMP_HORPLUS=0` (or RECOMP_WIDESCREEN=0) for the old picture. Front
+  end (game flow state 0x283434 == 3; 4 loading, 6 racing) zooms instead
+  (m11 x 4/3) so the garage keeps its 4:3 width -- the set ends (tunnel
+  mouth) just past it on the right; its camera (views 1 and 4, same as the
+  race) also turns left RECOMP_FE_YAW degrees (default 5). Main menu runs
+  views 0,1,4,8,10-15 like a race; view ids alone can't tell FE from race.
+  HUD and FE 2D are still stretched. EAGL::ViewPort (0x179E10/0x179FB0)
+  is not used for 3D. Found via VS-constant dump (WVP at c96) + RAM search
+  + gdb watch; FE state via .data diff menu/loading/race.
 - **XDK 5558 vs NFSU2's 5849:** D3D, DSOUND and the CRT are the same code
   apart from relocations; game code is not (different compiler output), so
   NFSU2's native game leaves, time cap, stream guard and text patch do not

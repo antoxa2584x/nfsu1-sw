@@ -4208,6 +4208,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     }
 
     if (subch != 0) {                      /* 3D class lives on subchannel 0 */
+        static int trace2d = -1, shown2d;
+        if (trace2d < 0) {
+            const char *e = getenv("RECOMP_PB_2D");
+            trace2d = e && *e && *e != '0';
+        }
+        if (trace2d && shown2d++ < 4000)
+            fprintf(stderr, "  [2D] subch %u method 0x%04X param 0x%08X\n",
+                    subch, method, param);
         note_unhandled(method, param);
         return;
     }
