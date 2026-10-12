@@ -13,7 +13,7 @@ instruction by instruction to C and running natively, with no emulator.
 ![OpenGL](https://img.shields.io/badge/OpenGL-renderer-5586A4?logo=opengl&logoColor=white)
 ![Version](https://img.shields.io/badge/version-0.3.2-blue)
 
-[Features](#-features) · [Playing on Switch](#-playing-on-switch) · [Building](#%EF%B8%8F-building) · [Configuration](#%EF%B8%8F-configuration) · [Status](#-status)
+[Features](#-features) · [Playing on Switch](#-playing-on-switch) · [Building](#%EF%B8%8F-building) · [Configuration](#%EF%B8%8F-configuration) · [Languages](#-languages) · [Status](#-status)
 
 </div>
 
@@ -189,8 +189,27 @@ lists every runtime switch; the ones that matter here:
 | `RECOMP_PAD_SCRIPT` | Timed presses, e.g. `4000:start:300,9000:a:200` (ms from the first pad read). |
 | `RECOMP_PAD_LAYOUT=position` | Map buttons by position (Xbox layout) instead of by label. |
 | `RECOMP_RUMBLE=0` | No rumble. |
+| `NFSU1_LANGUAGE` | Game language: `en` (default), `fr`, `de`, `it`, `es`, `nl`, `sv`, or `auto` (the console's). See [Languages](#-languages). |
 
 </details>
+
+## 🌍 Languages
+
+The USA disc already holds the text of seven languages and the in-game
+speech of five; the USA executable just never leaves English. Set
+`NFSU1_LANGUAGE=fr` (or `de`, `it`, `es`, `nl`, `sv`, `auto`) in
+`nfsu1x_env.txt`:
+
+| | On the USA disc | Dubbed cut-scenes |
+|---|---|---|
+| French, German, Spanish | text + speech | `FR*`, `GR*`, `SP*` `.MAD` on the PAL disc |
+| Italian | text + speech | `IT05_ENG`, `IT07_GOD` on the PAL disc |
+| Dutch, Swedish | text | none (English speech) |
+
+To get the dubbed cut-scenes, copy the PAL disc's `MOVIES/FR*.MAD` (for
+French) into `game/MOVIES/` next to the USA ones (only their sound
+differs). Without them the English cut-scenes play. Keep the USA
+`default.xbe`: the PAL one is a different build and is refused.
 
 ## 🚦 Status
 

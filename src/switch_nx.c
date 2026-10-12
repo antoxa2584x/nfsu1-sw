@@ -1240,6 +1240,31 @@ void switch_error_dialog(const char *msg, const char *details)
         fprintf(stderr, "[switch] error applet failed (0x%X)\n", rc);
 }
 
+/* The console's language as the game's index (recomp_manual.c,
+ * NFSU1_LANGUAGE=auto): 0 EN 1 FR 2 DE 3 IT 4 ES 5 NL. */
+int nfsu1_host_language(void)
+{
+    u64 code = 0;
+    SetLanguage l = SetLanguage_ENUS;
+    int lang = 0;
+
+    if (R_FAILED(setInitialize()))
+        return 0;
+    if (R_SUCCEEDED(setGetSystemLanguage(&code)) &&
+        R_SUCCEEDED(setMakeLanguage(code, &l))) {
+        switch (l) {
+        case SetLanguage_FR: case SetLanguage_FRCA:  lang = 1; break;
+        case SetLanguage_DE:                         lang = 2; break;
+        case SetLanguage_IT:                         lang = 3; break;
+        case SetLanguage_ES: case SetLanguage_ES419: lang = 4; break;
+        case SetLanguage_NL:                         lang = 5; break;
+        default:                                     lang = 0; break;
+        }
+    }
+    setExit();
+    return lang;
+}
+
 void switch_shutdown(void)
 {
     switch_saltynx_stop();
