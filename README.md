@@ -189,6 +189,7 @@ lists every runtime switch; the ones that matter here:
 | `RECOMP_PAD_SCRIPT` | Timed presses, e.g. `4000:start:300,9000:a:200` (ms from the first pad read). |
 | `RECOMP_PAD_LAYOUT=position` | Map buttons by position (Xbox layout) instead of by label. |
 | `RECOMP_RUMBLE=0` | No rumble. |
+| `NFSU1_AUTOLOAD=1` | At boot, load the most recent saved profile straight away (no "load?" questions) when there is one. |
 
 </details>
 
