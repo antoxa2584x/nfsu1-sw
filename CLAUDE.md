@@ -195,6 +195,12 @@ https://github.com/antoxa2584x/nfsu1-sw (`main`, commits as
 - Template bug: xboxrecomp `templates/new-game/src/recomp_manual.c` needs
   `#include <stddef.h>`.
 
+- **Up to 60 fps (2026-10-14, recomp_manual.c sub_001DA120 PGRAPH wrapper,
+  from NFSU2 v0.5.9):** the game asks D3D for a 2-vblank presentation
+  interval; the flip NOP trap carries it as (bits << 5) | 1 and the wrapper
+  rewrites it to 1 in TRAPPED_DATA. `NFSU2_FPS_CAP=30` keeps the title's.
+  Log `[fps] flip interval 2 -> 1 vblank (uncapped)`. Not yet tested.
+
 ## Status (2026-10-03)
 
 - Linux: movies -> title -> menus -> Quick Race racing at 30 fps (vblank),

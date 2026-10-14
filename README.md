@@ -183,6 +183,7 @@ lists every runtime switch; the ones that matter here:
 |---|---|
 | `NFSU2_GAME_DIR` | Extracted disc (Linux; default `./game`). The Switch always uses `sdmc:/switch/nfsu1x/game/`. |
 | `NFSU2_GL=0` | Use the executor's CPU renderer instead of the GPU renderer. |
+| `NFSU2_FPS_CAP=30` | Keep the game's 30 fps cap (default: uncapped, up to 60 fps). |
 | `RECOMP_AUDIO_VOLUME` | Master volume 0..100 (default 50). |
 | `RECOMP_AUDIO=0` | No host audio device. |
 | `RECOMP_PAD_SCRIPT` | Timed presses, e.g. `4000:start:300,9000:a:200` (ms from the first pad read). |
