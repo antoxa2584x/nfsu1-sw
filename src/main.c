@@ -341,6 +341,19 @@ static int game_main(void)
     }
     printf("XBE %s: %zu bytes\n", xbe_path, xbe_size);
 
+    /* The C was lifted from the NTSC-U default.xbe (built 2003-10-12,
+     * header time 0x3F89F281). The PAL disc's default.xbe is another build
+     * (same title id, code moved around): its data under this code crashes
+     * at once. Other languages need no other executable: NFSU1_LANGUAGE. */
+    if (xbe_size < 0x118 ||
+        *(const uint32_t *)((const uint8_t *)xbe_data + 0x114) != 0x3F89F281u) {
+        fatal("This default.xbe is not the one of the Xbox NTSC-U (USA) disc "
+              "this port is built from. Keep the USA default.xbe; for French, "
+              "German, Italian or Spanish set NFSU1_LANGUAGE in nfsu1x_env.txt.");
+        free(xbe_data);
+        return 1;
+    }
+
     if (!xbox_MemoryLayoutInit(xbe_data, xbe_size)) {
         fatal("Failed to initialise the Xbox memory layout "
               "(the guest address range may be unavailable).");

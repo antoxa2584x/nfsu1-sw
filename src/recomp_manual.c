@@ -883,6 +883,125 @@ void sub_0011BC20(void)
     esp += 4;                                   /* ret */
 }
 
+/* ── Game language (NFSU1_LANGUAGE) ──────────────────────────
+ *
+ * sub_00011190 picks the language at boot (sub_00159750 hands it to
+ * SetLanguage, sub_00159660). The PAL build maps XGetLanguage() there
+ * (1 English -> 0, 4 French -> 1, 3 German -> 2) behind an "is PAL" test;
+ * in this NTSC-U build that test is sub_00151960, a `xor eax,eax; ret` the
+ * linker folded with 60-odd other functions, so the result is always 0.
+ * Everything else is already language-driven (current language at
+ * 0x2552C4): the NTSC-U disc carries all the text (LANGUAGES\LANGUAGE_*.BIN,
+ * table 0x255258: 0 EN 1 FR 2 DE 3 IT 4 ES 5 NL 6 SV) and the speech of
+ * 0-4 (SOUND\STREAMS\STRM_*_Speech_MB.ast, sub_000FD2E0); 5 and 6 fall back
+ * to English speech. Only the dubbed cut-scenes are missing: the movie
+ * table (0x2552F0, 22 rows of 9 {language, name}, sub_001595C0) names
+ * FR01_DAY, GR01_DAY, ... which are on the PAL disc. A localized movie
+ * that is not in game/MOVIES/ is pointed back at the English one here, so
+ * the text and voices work from the NTSC-U disc alone.
+ *
+ * NFSU1_LANGUAGE = en (default) | fr | de | it | es | nl | sv | auto
+ * (auto: the console's language on Switch, LANG elsewhere). */
+#define NFSU1_MOVIE_TABLE 0x002552F0u
+#define NFSU1_MOVIE_ROWS  22
+#define NFSU1_MOVIE_ROW   0x48u
+
+int nfsu1_host_language(void);          /* switch_nx.c; 0 elsewhere */
+
+static int nfsu1_language_code(const char *s)
+{
+    static const char *const codes[] = { "en", "fr", "de", "it", "es", "nl", "sv" };
+    int i;
+
+    if (!s || !*s)
+        return 0;
+    if (s[0] >= '0' && s[0] <= '6' && !s[1])
+        return s[0] - '0';
+    for (i = 0; i < 7; i++)
+        if ((s[0] | 0x20) == codes[i][0] && (s[1] | 0x20) == codes[i][1])
+            return i;
+    return -1;
+}
+
+static int nfsu1_language(void)
+{
+    const char *e = getenv("NFSU1_LANGUAGE");
+    int lang;
+
+    if (e && strcmp(e, "auto") == 0) {
+#if defined(__SWITCH__)
+        lang = nfsu1_host_language();
+#else
+        lang = nfsu1_language_code(getenv("LANG"));
+#endif
+    } else
+        lang = nfsu1_language_code(e);
+    if (lang < 0) {
+        fprintf(stderr, "[lang] NFSU1_LANGUAGE=%s not known, English\n", e);
+        lang = 0;
+    }
+    return lang;
+}
+
+/* Is MOVIES/<name>.mad in the game directory? (any case) */
+static int nfsu1_movie_present(const char *name)
+{
+    const char *dir = getenv("NFSU2_GAME_DIR");
+    char path[512];
+    FILE *f;
+    int i, n;
+
+#if defined(__SWITCH__)
+    if (!dir || !*dir)
+        dir = "sdmc:/switch/nfsu1x/game";
+#else
+    if (!dir || !*dir)
+        dir = "game";
+#endif
+    for (i = 0; i < 3; i++) {             /* as named, .MAD, all upper case */
+        n = snprintf(path, sizeof path, "%s/MOVIES/%s%s", dir, name,
+                     i ? ".MAD" : ".mad");
+        if (i == 2)
+            for (char *p = path + strlen(dir); p < path + n; p++)
+                if (*p >= 'a' && *p <= 'z') *p -= 32;
+        f = fopen(path, "rb");
+        if (f) {
+            fclose(f);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+void sub_00011190(void)
+{
+    static const char *const names[] = { "English", "French", "German", "Italian",
+                                         "Spanish", "Dutch", "Swedish" };
+    int lang = nfsu1_language(), row, e, missing = 0;
+
+    if (lang > 0) {
+        for (row = 0; row < NFSU1_MOVIE_ROWS; row++) {
+            uint32_t r = NFSU1_MOVIE_TABLE + (uint32_t)row * NFSU1_MOVIE_ROW;
+            uint32_t eng = MEM32(r + 4u);
+            if (MEM32(r) != 0 || !eng)
+                continue;
+            for (e = 1; e < 9; e++) {
+                uint32_t name = MEM32(r + 8u * e + 4u);
+                if (MEM32(r + 8u * e) != (uint32_t)lang || !name || name == eng)
+                    continue;
+                if (!nfsu1_movie_present((const char *)XBOX_PTR(name))) {
+                    MEM32(r + 8u * e + 4u) = eng;   /* English picture and sound */
+                    missing++;
+                }
+            }
+        }
+    }
+    fprintf(stderr, "[lang] %s, %d localized movie(s) not in game/MOVIES (English instead)\n",
+            names[lang], missing);
+    eax = (uint32_t)lang;
+    esp += 4;                                   /* ret */
+}
+
 /* ── Manual function overrides ─────────────────────────────── */
 
 /*
