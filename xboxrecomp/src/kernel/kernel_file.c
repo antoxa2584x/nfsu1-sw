@@ -787,6 +787,20 @@ static NTSTATUS errno_to_status(int e)
     }
 }
 
+/* Files open through NtCreateFile (the bridge's NtClose counts them down);
+ * the stuck report prints the number when it moves. */
+volatile LONG xbox_open_files;
+
+/* A host file operation that failed for a reason other than "not there":
+ * on the console a full or read-only SD card, or too many open files. The
+ * first 64 are logged. */
+static void file_failed(const char *op, int e, const char *path)
+{
+    static volatile LONG n;
+    if (InterlockedIncrement(&n) <= 64)
+        fprintf(stderr, "[file] %s failed, errno %d: %s\n", op, e, path ? path : "?");
+}
+
 /* The descriptor of a directory handle on hosts that cannot open() one. */
 #define XBOX_DIR_FD (-2)
 
@@ -916,6 +930,8 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     if (fd < 0 && fd != XBOX_DIR_FD) {
         int e = errno;
         XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile FAILED: %s (errno=%d)", host_path, e);
+        if (e != ENOENT)                 /* a missing file is a normal probe */
+            file_failed("open", e, host_path);
         if (IoStatusBlock) {
             IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
             IoStatusBlock->Information = 0;
@@ -924,6 +940,9 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     }
 
     *FileHandle = w32_open_handle(fd, host_path);
+    if (CreateOptions & 0x00001000)              /* FILE_DELETE_ON_CLOSE */
+        w32_handle_delete_on_close(*FileHandle, 1);
+    InterlockedIncrement(&xbox_open_files);
     if (IoStatusBlock) {
         IoStatusBlock->Status = STATUS_SUCCESS;
         IoStatusBlock->Information = (CreateDisposition == XBOX_FILE_CREATE) ? 2 : 1;
@@ -960,6 +979,7 @@ NTSTATUS __stdcall xbox_NtReadFile(
     ssize_t n = host_read(fd, Buffer, Length);
     if (n < 0) {
         XBOX_TRACE(XBOX_LOG_FILE, "NtReadFile(handle=%p) errno=%d", FileHandle, errno);
+        file_failed("read", errno, w32_handle_path(FileHandle));
         IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
         IoStatusBlock->Information = 0;
         return STATUS_UNSUCCESSFUL;
@@ -998,6 +1018,7 @@ NTSTATUS __stdcall xbox_NtWriteFile(
     ssize_t n = host_write(fd, Buffer, Length);
     if (n < 0) {
         XBOX_TRACE(XBOX_LOG_FILE, "NtWriteFile(handle=%p) errno=%d", FileHandle, errno);
+        file_failed("write", errno, w32_handle_path(FileHandle));
         IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
         IoStatusBlock->Information = 0;
         return STATUS_UNSUCCESSFUL;
@@ -1133,12 +1154,11 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
         }
         case XboxFileDispositionInformation: {
             PXBOX_FILE_DISPOSITION_INFORMATION info = (PXBOX_FILE_DISPOSITION_INFORMATION)FileInformation;
-            /* POSIX: unlinking an open file removes it on last close -- this
-             * matches NT "delete on close" semantics exactly. */
-            if (info->DeleteFile) {
-                const char* p = w32_handle_path(FileHandle);
-                if (p) unlink(p);
-            }
+            /* NT: the file or (empty) directory goes when its last handle
+             * closes. Unlinking here missed directories -- XDeleteSaveGame
+             * removes a save's folder this way, so a profile deleted in the
+             * game came back -- and Horizon cannot delete what is open. */
+            w32_handle_delete_on_close(FileHandle, info->DeleteFile != 0);
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
         }

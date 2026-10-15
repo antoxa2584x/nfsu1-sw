@@ -313,7 +313,9 @@ static void perf_report(void)
     }
     {
         void xbox_main_wait_report(double secs);
+        void xbox_kernel_stuck_report(void);
         xbox_main_wait_report(10.0);
+        xbox_kernel_stuck_report();      /* threads stuck in a kernel call, stalled streams */
     }
     xbox_perf_sample();
     xbox_nx_thread_report(10.0);
@@ -898,6 +900,54 @@ static void prof_thread(void *arg)
     }
 }
 
+/* ── Display vsync -> guest vblank (RECOMP_VBLANK_VSYNC=0: off) ─────
+ *
+ * The guest vblank otherwise comes from the kernel timer thread's 59.94 Hz
+ * clock, which drifts against the 60 Hz panel: a frame the title paced to
+ * its vblank is shown a refresh early or late every so often. This thread
+ * waits on the display's own vsync event and hands each one to the kernel
+ * (xbox_vblank_vsync), which then delivers the vblank on it; if they stop
+ * coming for 100 ms the timer takes over again. */
+static ViDisplay s_vsync_display;
+static Event s_vsync_event;
+
+static void vsync_thread(void *arg)
+{
+    void xbox_vblank_vsync(void);
+    unsigned n = 0;
+    (void)arg;
+    for (;;) {
+        if (R_FAILED(eventWait(&s_vsync_event, 100000000ull)))
+            continue;
+        xbox_vblank_vsync();
+        if (++n == 1)
+            puts("[switch] display vsync drives the guest vblank");
+    }
+}
+
+static void vsync_start(void)
+{
+    static Thread t;
+    const char *e = getenv("RECOMP_VBLANK_VSYNC");
+    Result rc;
+    if (e && *e == '0')
+        return;
+    rc = viInitialize(ViServiceType_Default);
+    if (R_SUCCEEDED(rc))
+        rc = viOpenDisplay("Default", &s_vsync_display);
+    if (R_SUCCEEDED(rc))
+        rc = viGetDisplayVsyncEvent(&s_vsync_display, &s_vsync_event);
+    if (R_FAILED(rc)) {
+        printf("[switch] no display vsync event (0x%X): guest vblank from the timer\n", rc);
+        return;
+    }
+    /* 0x2B: above the guest threads and the timer thread (0x2C), like an
+     * interrupt; it only wakes once a frame. */
+    if (R_FAILED(threadCreate(&t, vsync_thread, NULL, NULL, 0x4000, 0x2B, -2))
+        || R_FAILED(threadStart(&t)))
+        puts("[switch] vsync thread could not start");
+}
+
 static void prof_start(void)
 {
     static Thread t;
@@ -1218,6 +1268,7 @@ void switch_boot(void)
     switch_saltynx_start();
     loader_start();
     prof_start();
+    vsync_start();
 }
 
 void switch_error_dialog(const char *msg, const char *details)

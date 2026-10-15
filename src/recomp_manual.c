@@ -208,8 +208,10 @@ extern void sub_001D9BB0_gen(void);
 void sub_001D9BB0(void)
 {
     uint32_t blk = ecx;
-    uint32_t head = MEM32(blk + 0x1BC);
     uint8_t old = d3d_isr_enter();
+    /* Read under the dispatch lock: raising IRQL can drop the guest lock and
+     * let the other handler retire a flip, which we would count again. */
+    uint32_t head = MEM32(blk + 0x1BC);
 
     xbox_Nv2aVblankTaken();
     sub_001D9BB0_gen();
@@ -257,11 +259,11 @@ void sub_001DA120(void)
 {
     volatile uint32_t *nv = (volatile uint32_t *)XBOX_PTR(0xFD000000u);
     uint32_t blk = ecx;
-    uint32_t head = MEM32(blk + 0x1BC);
     uint8_t old = d3d_isr_enter();
-    uint32_t nsource;
+    uint32_t nsource, head;
 
     nv2a_pb_trap_lock();
+    head = MEM32(blk + 0x1BC);   /* under the locks, as in sub_001D9BB0 */
     nsource = nv[0x400108 / 4];
     if (nsource && (nv[0x400704 / 4] & 0xFFFFu) == 0x0100u && !fps_cap_30()) {
         uint32_t data = nv[0x400708 / 4];
@@ -397,6 +399,25 @@ static int horplus_on(void)
     return on;
 }
 
+/* 16:9 racing HUD (from cherepavel/nfsu1-android edb86d0 + e3db56f): under
+ * Hor+ the race's 2D pass gets square pixels too, its edge objects move
+ * out to the 16:9 edges, and menus drawn over the race keep their
+ * stretched 4:3 look. RECOMP_HUD_WIDE=0 leaves the HUD stretched. Set by
+ * sub_00016460 for the length of a race frame's 2D render. */
+static int s_ui_aspect_active;
+
+static int hud_wide_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_HUD_WIDE");
+        on = horplus_on() && !(e && e[0] == '0');
+        if (horplus_on())
+            fprintf(stderr, "[hud] 16:9 racing HUD %s\n", on ? "on (RECOMP_HUD_WIDE=0 for 4:3)" : "off");
+    }
+    return on;
+}
+
 void sub_00018E60(void)
 {
     s_proj_view = MEM32(esp + 4);
@@ -412,6 +433,17 @@ void sub_00018E40(void)
 {
     uint32_t v = s_proj_view;
     int fe;
+
+    /* The race's 2D pass (sub_00016460, returning to 0x16548) rebuilds view
+     * 0 with Menu Size on both axes and an identity projection: squeeze it
+     * to square pixels before the product. The 3D cameras take the path
+     * below. */
+    if (MEM32(esp) == 0x00016548u && s_ui_aspect_active) {
+        float m;
+        memcpy(&m, (void *)XBOX_PTR(ecx + 0x40), sizeof m);
+        m *= 0.75f;
+        memcpy((void *)XBOX_PTR(ecx + 0x40), &m, sizeof m);
+    }
 
     if (!v || MEM32(esp) != 0x0001902Au) {
         sub_00018E40_gen();
@@ -457,6 +489,114 @@ void sub_00018E40(void)
         }
     }
     sub_00018E40_gen();
+}
+
+/* The minimap renderer owns a screen-space centre (+0x68) and half
+ * extent (+0x70). Its draw builds the map and markers from that centre. */
+extern void sub_0014B510_gen(void);
+
+void sub_0014B510(void)
+{
+    uint32_t centre = ecx + 0x68;
+    uint32_t original = MEM32(centre);
+    float x;
+
+    memcpy(&x, &original, 4);
+    if (s_ui_aspect_active && MEM32(NFSU1_GAMEFLOW_STATE) == 6) {
+        if (x < 280.0f) x -= 640.0f / 6.0f;
+        else if (x > 360.0f) x += 640.0f / 6.0f;
+        memcpy((void *)XBOX_PTR(centre), &x, 4);
+    }
+    sub_0014B510_gen();
+    MEM32(centre) = original;
+}
+
+/* FEng renders the rest of the HUD through a cached circular list of
+ * quads. This path is shared by sprites and text (one quad per glyph).
+ * Select one anchor from the complete object's bounds, then translate all
+ * of its quads equally. Editing FEng layout descriptors would miss cached
+ * geometry; selecting an anchor for each glyph would split long strings. */
+extern void sub_000F8B80_gen(void);
+static float s_feng_shift;
+static int s_feng_draw;
+static int s_feng_menu_draw;
+
+/* sub_00016460 draws FEng menus through sub_000DC090, then the racing
+ * HUD through the callbacks at 0x265B8C. Game flow remains 6 for pause,
+ * rewards and race results: it cannot distinguish those menus from HUD.
+ * Undo the racing UI projection equally for every menu quad, including
+ * glyphs, so menus retain their original stretched presentation. */
+extern void sub_000DC090_gen(void);
+
+void sub_000DC090(void)
+{
+    int previous = s_feng_menu_draw;
+    s_feng_menu_draw = 1;
+    sub_000DC090_gen();
+    s_feng_menu_draw = previous;
+}
+
+void sub_000F8B80(void)
+{
+    uint32_t head = ecx + 0x18;
+    uint32_t node = MEM32(head);
+    float left = INFINITY, right = -INFINITY;
+    float previous_shift = s_feng_shift;
+    int previous_draw = s_feng_draw;
+    unsigned count = 0;
+
+    s_feng_shift = 0.0f;
+    s_feng_draw = s_ui_aspect_active;
+    if (s_feng_draw && !s_feng_menu_draw &&
+        MEM32(NFSU1_GAMEFLOW_STATE) == 6) {
+        while (node != head && node && count++ < 4096) {
+            /* List node +0x10 is the quad, its xyz vertices start +0x10. */
+            for (int i = 0; i < 4; i++) {
+                float x;
+                memcpy(&x, (void *)XBOX_PTR(node + 0x20 + i * 16), 4);
+                left = fminf(left, x); right = fmaxf(right, x);
+            }
+            node = MEM32(node);
+        }
+        if (node == head && count) {
+            float centre = (left + right) * 0.5f;
+            if (centre < 280.0f) s_feng_shift = -640.0f / 6.0f;
+            else if (centre > 360.0f) s_feng_shift = 640.0f / 6.0f;
+        }
+    }
+    sub_000F8B80_gen();
+    s_feng_shift = previous_shift;
+    s_feng_draw = previous_draw;
+}
+
+/* The racing pass has a 0.75 horizontal projection. Undo it for every
+ * menu quad to preserve the original stretched 4:3 menu, including text.
+ * Only racing HUD objects receive an edge shift. Restore cached geometry. */
+extern void sub_000192C0_gen(void);
+
+void sub_000192C0(void)
+{
+    uint32_t quad = MEM32(esp + 4);
+    float original_x[4];
+    float shift = s_feng_shift;
+    int i;
+    int stretch = s_feng_menu_draw;
+
+    if (!s_ui_aspect_active || (!stretch &&
+        (!s_feng_draw || shift == 0.0f))) {
+        sub_000192C0_gen();
+        return;
+    }
+    for (i = 0; i < 4; i++) {
+        float x;
+        memcpy(&x, (void *)XBOX_PTR(quad + 0x10 + i * 16), 4);
+        original_x[i] = x;
+        x = stretch ? 320.0f + (x - 320.0f) * (4.0f / 3.0f) : x + shift;
+        memcpy((void *)XBOX_PTR(quad + 0x10 + i * 16), &x, 4);
+    }
+    sub_000192C0_gen();
+    for (i = 0; i < 4; i++)
+        memcpy((void *)XBOX_PTR(quad + 0x10 + i * 16), &original_x[i], 4);
 }
 
 /* ── Options -> Camera: car reflections and picture rows ──────
@@ -811,12 +951,15 @@ static uint32_t s_menu_size_user;       /* bits the slider last stored */
 void sub_00016460(void)
 {
     uint32_t v = MEM32(NFSU1_MENU_SIZE);
+    int previous = s_ui_aspect_active;
     float f;
 
     memcpy(&f, &v, 4);
     if (v != s_menu_size_user && f > 0.919f && f < 0.921f)
         MEM32(NFSU1_MENU_SIZE) = 0x3F800000u;   /* 1.0f */
+    s_ui_aspect_active = hud_wide_on() && MEM32(NFSU1_GAMEFLOW_STATE) == 6;
     sub_00016460_gen();
+    s_ui_aspect_active = previous;
 }
 
 void sub_000C1860(void)

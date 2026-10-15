@@ -201,6 +201,24 @@ https://github.com/antoxa2584x/nfsu1-sw (`main`, commits as
   rewrites it to 1 in TRAPPED_DATA. `NFSU2_FPS_CAP=30` keeps the title's.
   Log `[fps] flip interval 2 -> 1 vblank (uncapped)`. Not yet tested.
 
+- **From third-party builds (2026-10-15, not run on hardware yet):**
+  cherepavel/nfsu1-android: flip-retire head read under the ISR locks,
+  NV2A interrupt-hold guard vs the ack pass, KeSetTimer resets the old
+  signal under g_timer_lock before publishing (a lost one-shot froze the
+  multimedia clock: autosave + music), 16:9 racing HUD (RECOMP_HUD_WIDE).
+  Reconstructed from a stripped "0.3.2-perf7j" NRO (strings + AArch64
+  disassembly; NVK thunks = our ELF's vk* - 0x211E0): RECOMP_VK_THREAD=1
+  (GL's RECOMP_GL_THREAD queue on Vulkan; records keep the title's vertex
+  pointers for instancing, dirty blocks re-marked on the VK side),
+  RECOMP_NX_PIN (executor core 1, VK thread core 2, prio 0x3A),
+  RECOMP_NX_TIMER_PRIO, RECOMP_VK_KICK (early submits, 8 CBs/frame),
+  RECOMP_VK_PACE (FIFO + nwindowSetSwapInterval from flip deltas),
+  RECOMP_VK_TEX_POOL (32 MB blocks), RECOMP_VK_TEX_IDLE,
+  RECOMP_VK_CONST_REUSE, RECOMP_VBLANK_VSYNC, RECOMP_TIMER_WATCH,
+  stuck/stream reports, NFSU1_R3_NEXT_SONG (src/nfsu1_extras.c), and
+  PulseEvent that actually wakes waiters. Not ported: VMERGE (needs VS
+  changes), UPLOAD_CB, SPARE_MB, ZCULL, FILL_GUARD, INST_WHY/FRAME_TRACE.
+
 ## Status (2026-10-03)
 
 - Linux: movies -> title -> menus -> Quick Race racing at 30 fps (vblank),

@@ -167,9 +167,13 @@ typedef struct {
     VkImage image; VkImageView view; VkDeviceMemory mem; VkPipeline pipe;
 } Garbage;
 
+/* Command buffers a frame can be split into (RECOMP_VK_KICK). */
+#define VK_CBS 8
+
 typedef struct {
     VkCommandPool   pool;
-    VkCommandBuffer cb;
+    VkCommandBuffer cbs[VK_CBS];
+    uint32_t        ncb;           /* the one being recorded */
     VkFence         fence;
     VkSemaphore     acquired, rendered;
     VkBuffer        ring;
@@ -184,11 +188,16 @@ typedef struct {
 static Frame  s_fr[VK_FRAMES];
 static Frame *s_f;             /* the frame being recorded */
 static uint32_t s_fi;
-static VkCommandBuffer s_cb;   /* s_f->cb while recording */
+static VkCommandBuffer s_cb;   /* s_f->cbs[s_f->ncb] while recording */
 static uint32_t s_cb_gen;      /* bumped at every vkBeginCommandBuffer */
 static int s_dyn_valid;
+static uint32_t s_kick_draws, s_st_kicks;   /* RECOMP_VK_KICK */
+static uint32_t s_ring_gen;    /* bumped whenever a ring starts over */
+static int kick_due(int mid_pass);
+static void kick_submit(void);
 
 static void garbage_add_pipe(VkPipeline pipe);
+static void pool_release(VkImage img);
 static void garbage_add(VkImage img, VkImageView view, VkDeviceMemory mem)
 {
     Frame *f = s_f;
@@ -216,6 +225,7 @@ static void garbage_free(Frame *f)
         if (f->garbage[i].view) vkDestroyImageView(s_dev, f->garbage[i].view, NULL);
         if (f->garbage[i].image) vkDestroyImage(s_dev, f->garbage[i].image, NULL);
         if (f->garbage[i].mem) vkFreeMemory(s_dev, f->garbage[i].mem, NULL);
+        else if (f->garbage[i].image) pool_release(f->garbage[i].image);
         if (f->garbage[i].pipe) vkDestroyPipeline(s_dev, f->garbage[i].pipe, NULL);
     }
     f->ngarbage = 0;
@@ -232,12 +242,15 @@ static void frame_begin(void)
     }
     garbage_free(s_f);
     s_f->ring_off = 0;
+    s_ring_gen++;
     vkResetCommandPool(s_dev, s_f->pool, 0);
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(s_f->cb, &bi);
-    s_cb = s_f->cb;
+    s_f->ncb = 0;
+    s_cb = s_f->cbs[0];
+    vkBeginCommandBuffer(s_cb, &bi);
     s_cb_gen++;
     s_dyn_valid = 0;
+    s_kick_draws = 0;
 }
 
 /* Space in this frame's ring: returns the offset, *ptr the mapping. */
@@ -404,6 +417,8 @@ static void begin_rendering(VkSurf *s, VkDepthBuf *d)
 
     if (s_in_render && s_rt == s && s_rt_depth == d)
         return;
+    if (kick_due(0))
+        kick_submit();
     end_rendering();
     barrier_all();
     ca.imageView = s->view;
@@ -452,6 +467,167 @@ static void image_to_general(VkImage img, VkImageAspectFlags aspect)
                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &b);
 }
 
+/* ── Image memory pool (RECOMP_VK_TEX_POOL) ───────────────────────────
+ *
+ * Every image had an allocation of its own: a vkAllocateMemory when a
+ * texture or surface first appeared and a vkFreeMemory when it went, each
+ * a round trip through the kernel on Horizon -- a burst of them when a race
+ * loads made the hitches. Images up to 16 MB now take a range of a 32 MB
+ * device-local block (up to 64 blocks, first fit); the range goes back
+ * when the image is destroyed (garbage_free, after its frame's fence).
+ * Larger images, and everything once the blocks are full, allocate as
+ * before. RECOMP_VK_TEX_POOL=0 off. */
+#define POOL_BLOCK      (32ull << 20)
+#define POOL_MAX_BLOCKS 64
+#define POOL_MAX_ALLOC  (16ull << 20)
+#define POOL_HASH       8192
+
+typedef struct { VkDeviceSize off, size; } PoolRange;
+typedef struct {
+    VkDeviceMemory mem;
+    uint32_t       type;
+    PoolRange     *free;             /* by offset, never adjacent */
+    uint32_t       nfree, cap;
+} PoolBlock;
+static PoolBlock s_pool[POOL_MAX_BLOCKS];
+static uint32_t  s_npool;
+static int       s_pool_on = -1;
+/* Pooled images: which range they hold. Linear probing. */
+static struct { VkImage img; uint32_t block; VkDeviceSize off, size; } s_pool_map[POOL_HASH];
+
+static uint32_t pool_slot(VkImage img)
+{
+    uint64_t k = (uint64_t)(uintptr_t)img;
+    k ^= k >> 29;
+    k *= 0xbf58476d1ce4e5b9ull;
+    k ^= k >> 32;
+    return (uint32_t)k & (POOL_HASH - 1);
+}
+
+static void pool_put(PoolBlock *b, VkDeviceSize off, VkDeviceSize size)
+{
+    uint32_t i = 0;
+    while (i < b->nfree && b->free[i].off < off)
+        i++;
+    if (i > 0 && b->free[i - 1].off + b->free[i - 1].size == off) {
+        b->free[i - 1].size += size;                /* joins the one before */
+        if (i < b->nfree && off + size == b->free[i].off) {
+            b->free[i - 1].size += b->free[i].size;
+            memmove(&b->free[i], &b->free[i + 1], (b->nfree - i - 1) * sizeof *b->free);
+            b->nfree--;
+        }
+        return;
+    }
+    if (i < b->nfree && off + size == b->free[i].off) {
+        b->free[i].off = off;                       /* joins the one after */
+        b->free[i].size += size;
+        return;
+    }
+    if (b->nfree == b->cap) {
+        b->cap = b->cap ? b->cap * 2 : 32;
+        b->free = (PoolRange *)realloc(b->free, b->cap * sizeof *b->free);
+    }
+    memmove(&b->free[i + 1], &b->free[i], (b->nfree - i) * sizeof *b->free);
+    b->free[i].off = off;
+    b->free[i].size = size;
+    b->nfree++;
+}
+
+static int pool_take(PoolBlock *b, VkDeviceSize size, VkDeviceSize align, VkDeviceSize *at)
+{
+    uint32_t i;
+    for (i = 0; i < b->nfree; i++) {
+        VkDeviceSize o = (b->free[i].off + align - 1) & ~(align - 1);
+        VkDeviceSize end = b->free[i].off + b->free[i].size, lo = b->free[i].off;
+        if (o + size > end)
+            continue;
+        memmove(&b->free[i], &b->free[i + 1], (b->nfree - i - 1) * sizeof *b->free);
+        b->nfree--;
+        if (o > lo)
+            pool_put(b, lo, o - lo);
+        if (o + size < end)
+            pool_put(b, o + size, end - (o + size));
+        *at = o;
+        return 1;
+    }
+    return 0;
+}
+
+/* Bind img to a pooled range; 0: allocate it as before. */
+static int pool_bind(VkImage img, const VkMemoryRequirements *rq)
+{
+    uint32_t type, i, h;
+    VkDeviceSize at;
+    if (s_pool_on < 0) {
+        const char *e = getenv("RECOMP_VK_TEX_POOL");
+        s_pool_on = !(e && *e == '0');
+    }
+    if (!s_pool_on || rq->size > POOL_MAX_ALLOC)
+        return 0;
+    type = mem_type(rq->memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (type == UINT32_MAX)
+        return 0;
+    h = pool_slot(img);
+    for (i = 0; s_pool_map[h].img && i < POOL_HASH; i++)
+        h = (h + 1) & (POOL_HASH - 1);
+    if (s_pool_map[h].img)
+        return 0;                                   /* map full */
+    for (i = 0; i <= s_npool; i++) {
+        PoolBlock *b = &s_pool[i];
+        if (i == s_npool) {
+            VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+            if (s_npool == POOL_MAX_BLOCKS)
+                return 0;
+            ai.allocationSize = POOL_BLOCK;
+            ai.memoryTypeIndex = type;
+            memset(b, 0, sizeof *b);
+            if (vkAllocateMemory(s_dev, &ai, NULL, &b->mem) != VK_SUCCESS)
+                return 0;
+            b->type = type;
+            pool_put(b, 0, POOL_BLOCK);
+            s_npool++;
+            LOGE("texture pool: block %u (%u MB)\n", s_npool, (unsigned)(POOL_BLOCK >> 20));
+        }
+        if (b->type != type || !pool_take(b, rq->size, rq->alignment, &at))
+            continue;
+        if (vkBindImageMemory(s_dev, img, b->mem, at) != VK_SUCCESS) {
+            pool_put(b, at, rq->size);
+            return 0;
+        }
+        s_pool_map[h].img = img;
+        s_pool_map[h].block = i;
+        s_pool_map[h].off = at;
+        s_pool_map[h].size = rq->size;
+        return 1;
+    }
+    return 0;
+}
+
+/* img is being destroyed: its range, if it has one, goes back. */
+static void pool_release(VkImage img)
+{
+    uint32_t h = pool_slot(img), n, j;
+    for (n = 0; n < POOL_HASH && s_pool_map[h].img != img; n++) {
+        if (!s_pool_map[h].img)
+            return;
+        h = (h + 1) & (POOL_HASH - 1);
+    }
+    if (n == POOL_HASH)
+        return;
+    pool_put(&s_pool[s_pool_map[h].block], s_pool_map[h].off, s_pool_map[h].size);
+    s_pool_map[h].img = VK_NULL_HANDLE;
+    /* Close the gap: move up later entries of the run that hash at or
+     * before it. */
+    for (j = (h + 1) & (POOL_HASH - 1); s_pool_map[j].img; j = (j + 1) & (POOL_HASH - 1)) {
+        uint32_t k = pool_slot(s_pool_map[j].img);
+        if ((j > h) ? (k <= h || k > j) : (k <= h && k > j)) {
+            s_pool_map[h] = s_pool_map[j];
+            s_pool_map[j].img = VK_NULL_HANDLE;
+            h = j;
+        }
+    }
+}
+
 /* layers: 1 = a 2D image, 6 = a cube map (cube view); levels: mip levels. */
 static int make_image_ml(uint32_t w, uint32_t h, uint32_t layers, uint32_t levels, VkFormat fmt,
                          VkImageUsageFlags usage, VkImageAspectFlags aspect,
@@ -477,12 +653,15 @@ static int make_image_ml(uint32_t w, uint32_t h, uint32_t layers, uint32_t level
     if (vkCreateImage(s_dev, &ci, NULL, img) != VK_SUCCESS)
         return 0;
     vkGetImageMemoryRequirements(s_dev, *img, &rq);
-    *mem = alloc_mem(rq, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (!*mem || vkBindImageMemory(s_dev, *img, *mem, 0) != VK_SUCCESS) {
-        vkDestroyImage(s_dev, *img, NULL);
-        if (*mem) vkFreeMemory(s_dev, *mem, NULL);
-        *img = VK_NULL_HANDLE; *mem = VK_NULL_HANDLE;
-        return 0;
+    *mem = VK_NULL_HANDLE;
+    if (!pool_bind(*img, &rq)) {
+        *mem = alloc_mem(rq, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (!*mem || vkBindImageMemory(s_dev, *img, *mem, 0) != VK_SUCCESS) {
+            vkDestroyImage(s_dev, *img, NULL);
+            if (*mem) vkFreeMemory(s_dev, *mem, NULL);
+            *img = VK_NULL_HANDLE; *mem = VK_NULL_HANDLE;
+            return 0;
+        }
     }
     vi.image = *img;
     vi.viewType = layers == 6 ? VK_IMAGE_VIEW_TYPE_CUBE : VK_IMAGE_VIEW_TYPE_2D;
@@ -494,7 +673,8 @@ static int make_image_ml(uint32_t w, uint32_t h, uint32_t layers, uint32_t level
         vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
     if (vkCreateImageView(s_dev, &vi, NULL, view) != VK_SUCCESS) {
         vkDestroyImage(s_dev, *img, NULL);
-        vkFreeMemory(s_dev, *mem, NULL);
+        if (*mem) vkFreeMemory(s_dev, *mem, NULL);
+        else pool_release(*img);
         *img = VK_NULL_HANDLE; *mem = VK_NULL_HANDLE;
         return 0;
     }
@@ -1393,14 +1573,6 @@ static int s_prog_head[PROG_BUCKETS];
 static uint32_t s_prog_made, s_prog_live;
 
 uint32_t nv2a_gl_program_count(void) { return s_prog_live; }
-/* The GL renderer's thread statistics; the Vulkan one records on the
- * executor's thread. */
-void nv2a_gl_queue_stats(double secs, int *gl_idle_pct, int *exec_wait_pct)
-{
-    (void)secs;
-    if (gl_idle_pct) *gl_idle_pct = 0;
-    if (exec_wait_pct) *exec_wait_pct = 0;
-}
 
 typedef struct {
     glslang_stage_t stage;
@@ -2076,6 +2248,72 @@ static void prewarm(void)
 
 /* ── Context ──────────────────────────────────────────────────────── */
 
+/* ── Frame pacing (RECOMP_VK_PACE, Switch) ────────────────────────────
+ *
+ * Presenting immediately shows each frame when it is ready: a title running
+ * at 30 shows frames for one, two or three vblanks in turn (judder), worse
+ * with the uncapped flip interval. Paced, the swapchain is FIFO and the
+ * display's swap interval follows how often the title flips: over the last
+ * eight flips, more than five two vblanks or more apart -> 2 (an even 30),
+ * two or fewer -> 1, in between it stays. Interval 2 only with the title's
+ * 30 fps cap (NFSU2_FPS_CAP=30): uncapped, a race at 30-50 fps chose 2,
+ * and at 2 no flip comes sooner than two vblanks, so it never went back --
+ * locked at 30. On unless RECOMP_VK_PACE=0; never headless. */
+static int s_pace = -1;
+static uint32_t s_pace_interval;
+
+static int pace_on(void)
+{
+    if (s_pace < 0) {
+#if defined(__SWITCH__)
+        const char *e = getenv("RECOMP_VK_PACE");
+        s_pace = !(e && *e == '0') && !s_headless;
+#else
+        s_pace = 0;
+#endif
+    }
+    return s_pace;
+}
+
+static void pace_flip(void)
+{
+#if defined(__SWITCH__)
+    extern uint32_t xbox_vblank_count(void);
+    static uint32_t last_vb, hist[8], nhist;
+    static int told;
+    uint32_t vb = xbox_vblank_count(), d = vb - last_vb, slow = 0, want, i;
+    static int cap30 = -1;
+
+    if (cap30 < 0) {
+        const char *e = getenv("NFSU2_FPS_CAP");
+        cap30 = e && atoi(e) == 30;
+    }
+
+    last_vb = vb;
+    if (!pace_on() || d < 1 || d > 8)
+        return;
+    hist[nhist++ & 7] = d;
+    if (nhist < 8)
+        return;
+    for (i = 0; i < 8; i++)
+        slow += hist[i] > 1;
+    if (slow > 5 && cap30)
+        want = 2;
+    else if (slow <= 2)
+        want = 1;
+    else
+        want = s_pace_interval ? s_pace_interval : 1;
+    if (want == s_pace_interval)
+        return;
+    if (R_SUCCEEDED(nwindowSetSwapInterval(nwindowGetDefault(), want))) {
+        if (told++ < 6)
+            LOGE("swap interval %u (title flips every %s vblank)\n", want,
+                 want == 2 ? "second" : "");
+        s_pace_interval = want;
+    }
+#endif
+}
+
 static int create_swapchain(void)
 {
     VkSurfaceCapabilitiesKHR caps;
@@ -2101,6 +2339,10 @@ static int create_swapchain(void)
         if (modes[i] == VK_PRESENT_MODE_IMMEDIATE_KHR) mode = modes[i];
     for (i = 0; i < nm && mode == VK_PRESENT_MODE_FIFO_KHR; i++)
         if (modes[i] == VK_PRESENT_MODE_MAILBOX_KHR) mode = modes[i];
+    if (pace_on()) {
+        mode = VK_PRESENT_MODE_FIFO_KHR;   /* the swap interval paces it */
+        s_pace_interval = 0;               /* a new swapchain: set it again */
+    }
     s_sc_extent = caps.currentExtent;
     if (s_sc_extent.width == 0xFFFFFFFFu) {
         s_sc_extent.width = 1280;
@@ -2427,8 +2669,8 @@ static int ready(void)
         vkCreateCommandPool(s_dev, &cpi, NULL, &f->pool);
         cai.commandPool = f->pool;
         cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cai.commandBufferCount = 1;
-        vkAllocateCommandBuffers(s_dev, &cai, &f->cb);
+        cai.commandBufferCount = VK_CBS;
+        vkAllocateCommandBuffers(s_dev, &cai, f->cbs);
         vkCreateFence(s_dev, &fci, NULL, &f->fence);
         vkCreateSemaphore(s_dev, &sci, NULL, &f->acquired);
         vkCreateSemaphore(s_dev, &sci, NULL, &f->rendered);
@@ -2486,11 +2728,59 @@ static void flush_frame_wait(void)
     vkResetFences(s_dev, 1, &s_f->fence);
     garbage_free(s_f);
     s_f->ring_off = 0;
+    s_ring_gen++;
     vkResetCommandPool(s_dev, s_f->pool, 0);
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    s_f->ncb = 0;
+    s_cb = s_f->cbs[0];
+    vkBeginCommandBuffer(s_cb, &bi);
+    s_cb_gen++;
+    s_dyn_valid = 0;
+}
+
+/* ── Early submits (RECOMP_VK_KICK) ───────────────────────────────────
+ *
+ * A frame used to be one command buffer, submitted at the flip: the GPU sat
+ * idle while the frame was recorded, then the next frame's recording waited
+ * on its fence. Now the recorded part goes to the queue every N draws
+ * (default 300; 0 = off) -- at the next change of render target, or past
+ * 2N draws in the middle of a pass -- without a fence, and recording goes on
+ * in the frame's next command buffer. The flip's submit carries the fence,
+ * which covers everything submitted before it. */
+static int s_kick_n = -1;
+
+static int kick_due(int mid_pass)
+{
+    if (s_kick_n < 0) {
+        const char *e = getenv("RECOMP_VK_KICK");
+        s_kick_n = e ? atoi(e) : 300;
+        if (s_kick_n < 0) s_kick_n = 0;
+        fprintf(stderr, "  [VK] early submits every %d draws%s\n", s_kick_n,
+                s_kick_n ? "" : " (off)");
+    }
+    if (!s_kick_n || s_f->ncb + 1 >= VK_CBS)
+        return 0;
+    return s_kick_draws >= (uint32_t)s_kick_n * (mid_pass ? 2u : 1u);
+}
+
+static void kick_submit(void)
+{
+    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    end_rendering();
+    s_rt = NULL;
+    s_rt_depth = NULL;
+    vkEndCommandBuffer(s_cb);
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &s_cb;
+    vkQueueSubmit(s_queue, 1, &si, VK_NULL_HANDLE);
+    s_cb = s_f->cbs[++s_f->ncb];
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(s_cb, &bi);
     s_cb_gen++;
     s_dyn_valid = 0;
+    s_kick_draws = 0;
+    s_st_kicks++;
 }
 
 /* ── Render state ─────────────────────────────────────────────────── */
@@ -2946,10 +3236,28 @@ typedef struct {
 extern uint8_t *nv2a_pb_reg_dirty(void);
 static uint32_t s_regs_seen[0x2000 / 4];    /* registers as of the last draw */
 
+/* Recording on a thread of its own (RECOMP_VK_THREAD, below): the executor's
+ * dirty blocks are taken by the queue, which marks here the blocks a record
+ * brought; and a queued draw's vertex pointers point into the record, so
+ * instancing compares the title's pointers, which the record keeps too. */
+static int s_q_on;
+static uint8_t s_q_dirty[0x2000 / 64];
+static const uint8_t *const *s_q_src;
+
+static uint8_t *reg_dirty(void)
+{
+    return s_q_on ? s_q_dirty : nv2a_pb_reg_dirty();
+}
+
+static const uint8_t *direct_src(const Nv2aRawBatch *b, uint32_t a)
+{
+    return s_q_src ? s_q_src[a] : b->direct[a].ptr;
+}
+
 /* Did a register a draw depends on change since the last draw? */
 static int regs_changed(const uint32_t *r)
 {
-    uint8_t *dirty = nv2a_pb_reg_dirty();
+    uint8_t *dirty = reg_dirty();
     uint32_t blk, w;
     int changed = 0;
 
@@ -2989,7 +3297,7 @@ static struct {
     size_t       idx_cap;
 } s_pend;
 static int s_inst_on = -1, s_inst_alt;
-static uint32_t s_st_draws, s_st_calls, s_st_inst;
+static uint32_t s_st_draws, s_st_calls, s_st_inst, s_st_creuse;
 
 static void pend_flush(void)
 {
@@ -3017,7 +3325,7 @@ static int pend_matches(const Nv2aRawBatch *b)
         return 0;
     for (a = 0; a < NV2A_RAW_ATTRS; a++)
         if ((b->attr_direct & (1u << a))
-         && (b->direct[a].ptr != s_pend.direct[a].ptr || b->direct[a].type != s_pend.direct[a].type
+         && (direct_src(b, a) != s_pend.direct[a].ptr || b->direct[a].type != s_pend.direct[a].type
           || b->direct[a].size != s_pend.direct[a].size || b->direct[a].stride != s_pend.direct[a].stride))
             return 0;
     return !memcmp(b->indices, s_pend.idx, (size_t)b->index_count * 4);
@@ -3061,7 +3369,7 @@ static void pend_hold(const Nv2aRawBatch *b, uint32_t n, VkDeviceSize cat, uint3
     memcpy(s_pend.tex_va, b->tex_va, sizeof s_pend.tex_va);
     memcpy(s_pend.pal_va, b->pal_va, sizeof s_pend.pal_va);
     for (a = 0; a < NV2A_RAW_ATTRS; a++) {
-        s_pend.direct[a].ptr = b->direct[a].ptr;
+        s_pend.direct[a].ptr = direct_src(b, a);
         s_pend.direct[a].type = b->direct[a].type;
         s_pend.direct[a].size = b->direct[a].size;
         s_pend.direct[a].stride = b->direct[a].stride;
@@ -3145,6 +3453,9 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
             return;
     }
     pend_flush();
+    s_kick_draws++;
+    if (kick_due(1))
+        kick_submit();
     if (!prim_indices(b, &idx, &n, &topo, &cls) || !n)
         return;
     VT("draw: prim %u idx %u verts %u attrs %04X direct %04X xform %u surf %08X zeta %08X\n", b->prim, n,
@@ -3211,6 +3522,7 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
             if (need > RING_BYTES) return;
             ring_alloc(RING_BYTES, 16, &tmp);       /* forces the flush */
             s_f->ring_off = 0;
+            s_ring_gen++;
         }
     }
     begin_rendering(s, d);
@@ -3292,10 +3604,33 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
         }
     }
     {
-        /* Constants last: repeats append theirs right behind (pend_append). */
-        VkDeviceSize cat = ring_alloc(VK_CONST_SIZE, s_ubo_align, &map), range;
-        if (!map) return;
-        memcpy(map, b->vp_consts, VK_CONST_SIZE);
+        /* Constants last: repeats append theirs right behind (pend_append).
+         * A draw that cannot start an instanced run, with the constants of
+         * the last set uploaded (same generation, still in this ring),
+         * points at that set instead of copying 3 KB again: HUD and 2D
+         * passes draw many quads under one matrix. RECOMP_VK_CONST_REUSE=0
+         * off. */
+        static int reuse_on = -1;
+        static VkDeviceSize last_at;
+        static uint32_t last_gen, last_ring_gen;
+        VkDeviceSize cat, range;
+        int eligible = pend_eligible(b);
+        if (reuse_on < 0) {
+            const char *e = getenv("RECOMP_VK_CONST_REUSE");
+            reuse_on = !(e && *e == '0');
+        }
+        if (reuse_on && !eligible && b->vp_const_gen && b->vp_const_gen == last_gen
+         && last_ring_gen == s_ring_gen && last_at + VK_CONST_SIZE <= s_f->ring_off) {
+            cat = last_at;
+            s_st_creuse++;
+        } else {
+            cat = ring_alloc(VK_CONST_SIZE, s_ubo_align, &map);
+            if (!map) return;
+            memcpy(map, b->vp_consts, VK_CONST_SIZE);
+            last_at = cat;
+            last_gen = b->vp_const_gen;
+            last_ring_gen = s_ring_gen;
+        }
         range = (VkDeviceSize)VK_CONST_SIZE * VK_INST_MAX;
         if (range > s_ubo_range) range = s_ubo_range;
         if (cat + range > RING_BYTES) range = RING_BYTES - cat;
@@ -3776,10 +4111,12 @@ static void vk_flip(void)
             st = e && *e == '1';
         }
         if (st && s_frame - st_frame >= 300) {
-            fprintf(stderr, "[vk] per frame: %u draws -> %u draw calls (%u instances appended)\n",
+            fprintf(stderr, "[vk] per frame: %u draws -> %u draw calls (%u instances appended), "
+                    "%u constant sets reused, %u early submits\n",
                     s_st_draws / (s_frame - st_frame), s_st_calls / (s_frame - st_frame),
-                    s_st_inst / (s_frame - st_frame));
-            s_st_draws = s_st_calls = s_st_inst = 0;
+                    s_st_inst / (s_frame - st_frame), s_st_creuse / (s_frame - st_frame),
+                    s_st_kicks / (s_frame - st_frame));
+            s_st_draws = s_st_calls = s_st_inst = s_st_creuse = s_st_kicks = 0;
             st_frame = s_frame;
         }
     }
@@ -3967,6 +4304,7 @@ static void vk_flip(void)
             vkDeviceWaitIdle(s_dev);
             create_swapchain();
         }
+        pace_flip();
     }
     {
         static uint64_t last_save;
@@ -3974,6 +4312,24 @@ static void vk_flip(void)
         if (s_pipes_unsaved && now - last_save > 20000000000ull) {
             last_save = now;
             pcache_save();
+        }
+    }
+    {
+        /* Textures nobody sampled for RECOMP_VK_TEX_IDLE frames (default
+         * 900; 0 = keep until the budget evicts them) go, checked every 60
+         * frames: a race leaves the front end's and the last track's
+         * behind, and every tex_get walks past them. */
+        static int idle = -1;
+        if (idle < 0) {
+            const char *e = getenv("RECOMP_VK_TEX_IDLE");
+            idle = e ? atoi(e) : 900;
+            if (idle < 0) idle = 0;
+        }
+        if (idle && s_frame % 60 == 0) {
+            uint32_t i;
+            for (i = 0; i < VK_MAX_TEX; i++)
+                if (s_tex[i].image && s_frame - s_tex[i].used > (uint32_t)idle)
+                    tex_free(&s_tex[i]);
         }
     }
     VT("flip %u: presented, waiting for frame slot\n", s_frame);
@@ -3988,6 +4344,411 @@ static void vk_flip(void)
     }
 #endif
 }
+
+/* ── Recording on a thread of its own (RECOMP_VK_THREAD=1) ────────────
+ *
+ * The console profile of a race: one thread (the executor) at 95-100% of a
+ * core, decoding the pushbuffer and recording Vulkan one after the other,
+ * while the game thread waits on it. With this on, the executor only decodes
+ * and queues; a thread of its own records and submits, so the two halves
+ * run on two cores (core 1 and core 2 with RECOMP_NX_PIN).
+ *
+ * The queue is the GL renderer's (nv2a_gl.c, RECOMP_GL_THREAD), records
+ * and all: a queued draw must not point at anything the executor or the
+ * title may change once it moves on, so the executor copies the method
+ * shadow, transform program and constants (as the 64/16-byte blocks that
+ * differ from what was last queued), the vertex byte ranges a draw reads,
+ * converted attributes and indices. Texture images are still read from
+ * guest memory when the recording thread gets to them, at most two flips
+ * behind; their addresses come resolved in the batch. Besides the pointers,
+ * a draw record keeps the title's vertex pointers (instancing compares
+ * them), and the recording thread marks the shadow blocks a record brought
+ * (regs_changed reads those in place of the executor's). */
+enum { Q_WRAP = 0, Q_DRAW = 1, Q_CLEAR = 2, Q_FLIP = 3 };
+typedef struct { uint32_t type, size, nreg, nprog, nconst, pad[3]; } QHdr;
+typedef struct { uint32_t idx, pad[3]; uint32_t w[16]; } QRegChunk;   /* 64 B of shadow */
+typedef struct { uint32_t idx, pad[3]; uint32_t w[4]; } QRow;         /* 16 B row */
+typedef struct {
+    Nv2aSurface s;
+    Nv2aRenderState rs;
+    int has_rs;
+    uint32_t flags, argb, zs;
+} QClear;
+
+#define Q_BYTES    (32u << 20)
+#define Q_ALIGN(x) (((x) + 15u) & ~(size_t)15u)
+#define REG_WORDS  (0x2000 / 4)
+#define PROG_ROWS  136
+#define CONST_ROWS 192
+
+static uint8_t *s_q;
+static size_t s_q_head, s_q_tail;               /* bytes written / read, ever */
+static int s_q_consumer_waits, s_q_producer_waits, s_q_flips;
+static pthread_mutex_t s_q_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t s_q_cv = PTHREAD_COND_INITIALIZER;
+static uint64_t s_q_dropped;
+/* For the perf report: time the recording thread sat with an empty queue,
+ * and the executor was held back (queue full, or two flips queued). ns. */
+static uint64_t s_q_idle_ns, s_q_exec_wait_ns;
+
+/* Executor thread: what was last queued, and where the live shadow is. */
+static uint32_t s_q_regs[REG_WORDS], s_q_prog[PROG_ROWS][4];
+static float s_q_consts[CONST_ROWS][4];
+static const uint32_t *s_q_live_regs;
+static uint32_t s_q_prog_gen, s_q_const_gen;
+/* Recording thread: its own copies, rebuilt from the records. */
+static uint32_t g_regs[REG_WORDS], g_prog[PROG_ROWS][4];
+static float g_consts[CONST_ROWS][4];
+
+static void q_timed_wait(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_nsec += 2000000;
+    if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+    pthread_cond_timedwait(&s_q_cv, &s_q_lock, &ts);
+}
+
+/* Room for `size` contiguous bytes; returns where to write them. */
+static uint8_t *q_reserve(size_t size)
+{
+    size_t off = s_q_head % Q_BYTES, need = size;
+    if (off + size > Q_BYTES)
+        need += Q_BYTES - off;                  /* the wrap filler */
+    if (Q_BYTES - (s_q_head - __atomic_load_n(&s_q_tail, __ATOMIC_ACQUIRE)) < need) {
+        uint64_t t0 = hz_now();
+        pthread_mutex_lock(&s_q_lock);
+        s_q_producer_waits = 1;
+        while (Q_BYTES - (s_q_head - __atomic_load_n(&s_q_tail, __ATOMIC_ACQUIRE)) < need)
+            q_timed_wait();
+        s_q_producer_waits = 0;
+        pthread_mutex_unlock(&s_q_lock);
+        __atomic_add_fetch(&s_q_exec_wait_ns, hz_now() - t0, __ATOMIC_RELAXED);
+    }
+    if (off + size > Q_BYTES) {
+        QHdr *w = (QHdr *)(s_q + off);
+        w->type = Q_WRAP;                        /* ring has slack past the end */
+        w->size = (uint32_t)(Q_BYTES - off);
+        __atomic_store_n(&s_q_head, s_q_head + (Q_BYTES - off), __ATOMIC_RELEASE);
+        off = 0;
+    }
+    return s_q + off;
+}
+
+static void q_publish(size_t size)
+{
+    __atomic_store_n(&s_q_head, s_q_head + size, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&s_q_consumer_waits, __ATOMIC_SEQ_CST)) {
+        pthread_mutex_lock(&s_q_lock);
+        pthread_cond_broadcast(&s_q_cv);
+        pthread_mutex_unlock(&s_q_lock);
+    }
+}
+
+/* The shadow blocks that changed since the last record: the executor's
+ * dirty blocks that really differ, kept until q_reg_emit. */
+static uint16_t s_q_pend[REG_WORDS / 16];
+static uint32_t s_q_npend;
+
+static uint32_t q_reg_collect(void)
+{
+    uint8_t *dirty = nv2a_pb_reg_dirty();
+    uint32_t c;
+    if (!s_q_live_regs)
+        return 0;
+    for (c = 0; c < REG_WORDS / 16; c++) {
+        if (!dirty[c])
+            continue;
+        dirty[c] = 0;
+        if (memcmp(s_q_live_regs + c * 16, s_q_regs + c * 16, 64) != 0) {
+            uint32_t k;
+            for (k = 0; k < s_q_npend && s_q_pend[k] != c; k++) { }
+            if (k == s_q_npend)
+                s_q_pend[s_q_npend++] = (uint16_t)c;
+        }
+    }
+    return s_q_npend;
+}
+
+static uint32_t q_reg_emit(QRegChunk *out)
+{
+    uint32_t k, n = s_q_npend;
+    for (k = 0; k < n; k++) {
+        uint32_t c = s_q_pend[k];
+        out[k].idx = c;
+        memcpy(out[k].w, s_q_live_regs + c * 16, 64);
+        memcpy(s_q_regs + c * 16, s_q_live_regs + c * 16, 64);
+    }
+    s_q_npend = 0;
+    return n;
+}
+
+static uint32_t q_rows_diff(const uint32_t (*live)[4], uint32_t (*sent)[4], uint32_t rows,
+                            QRow *out)
+{
+    uint32_t r, n = 0;
+    for (r = 0; r < rows; r++)
+        if (memcmp(live[r], sent[r], 16) != 0) {
+            if (out) {
+                out[n].idx = r;
+                memcpy(out[n].w, live[r], 16);
+                memcpy(sent[r], live[r], 16);
+            }
+            n++;
+        }
+    return n;
+}
+
+/* Header plus the shadow changes; returns the offset after them. */
+static size_t q_write_state(uint8_t *rec, uint32_t type, uint32_t nprog, uint32_t nconst,
+                            const Nv2aRawBatch *b)
+{
+    QHdr *h = (QHdr *)rec;
+    size_t at = sizeof(QHdr);
+    memset(h, 0, sizeof *h);
+    h->type = type;
+    h->nreg = q_reg_emit((QRegChunk *)(rec + at));
+    at += (size_t)h->nreg * sizeof(QRegChunk);
+    if (b && nprog) {
+        h->nprog = q_rows_diff(b->vp_program, s_q_prog, PROG_ROWS, (QRow *)(rec + at));
+        at += (size_t)h->nprog * sizeof(QRow);
+    }
+    if (b && nconst) {
+        h->nconst = q_rows_diff((const uint32_t (*)[4])b->vp_consts,
+                                (uint32_t (*)[4])s_q_consts, CONST_ROWS, (QRow *)(rec + at));
+        at += (size_t)h->nconst * sizeof(QRow);
+    }
+    return at;
+}
+
+static void q_draw(const Nv2aRawBatch *b)
+{
+    VRun run[NV2A_RAW_ATTRS];
+    int of_run[NV2A_RAW_ATTRS];
+    uint32_t nrun = vertex_runs(b, b->attr_direct, run, of_run), i, a, nreg, nprog = 0, nconst = 0;
+    uint16_t conv = b->attr_present & (uint16_t)~b->attr_direct;
+    size_t size, at, runs_at[NV2A_RAW_ATTRS], attrs_at = 0, idx_at, batch_at, src_at;
+    Nv2aRawBatch *qb;
+    const uint8_t **src;
+    uint8_t *rec;
+
+    s_q_live_regs = b->regs;
+    nreg = q_reg_collect();
+    if (b->vp_program && b->vp_prog_gen != s_q_prog_gen && b->vp_slots <= PROG_ROWS)
+        nprog = q_rows_diff(b->vp_program, s_q_prog, PROG_ROWS, NULL);
+    if (b->vp_consts && b->vp_const_gen != s_q_const_gen && b->vp_const_count <= CONST_ROWS)
+        nconst = q_rows_diff((const uint32_t (*)[4])b->vp_consts,
+                             (uint32_t (*)[4])s_q_consts, CONST_ROWS, NULL);
+    size = sizeof(QHdr) + (size_t)nreg * sizeof(QRegChunk)
+         + (size_t)(nprog + nconst) * sizeof(QRow);
+    batch_at = size;
+    size += Q_ALIGN(sizeof(Nv2aRawBatch));
+    src_at = size;
+    size += Q_ALIGN(sizeof(const uint8_t *) * NV2A_RAW_ATTRS);
+    for (i = 0; i < nrun; i++) {
+        runs_at[i] = size;
+        size += Q_ALIGN((size_t)(run[i].hi - run[i].lo));
+    }
+    if (conv) {
+        attrs_at = size;
+        size += Q_ALIGN((size_t)b->vertex_count * NV2A_RAW_ATTRS * 16);
+    }
+    idx_at = size;
+    size += Q_ALIGN((size_t)b->index_count * 4);
+    if (size > Q_BYTES / 4) {
+        if ((s_q_dropped++ & 1023) == 0)
+            LOGE("queued draw of %zu bytes dropped (%llu so far)\n",
+                 size, (unsigned long long)s_q_dropped);
+        return;
+    }
+
+    rec = q_reserve(size);
+    at = q_write_state(rec, Q_DRAW, nprog, nconst, b);
+    s_q_prog_gen = b->vp_prog_gen;
+    s_q_const_gen = b->vp_const_gen;
+    if (at != batch_at) {                       /* cannot happen: same diffs */
+        LOGE("queue record mismatch %zu/%zu\n", at, batch_at);
+        abort();
+    }
+    qb = (Nv2aRawBatch *)(rec + batch_at);
+    *qb = *b;
+    src = (const uint8_t **)(rec + src_at);
+    /* Pointers become offsets into the record; the recording thread fixes
+     * them. */
+    for (i = 0; i < nrun; i++)
+        memcpy(rec + runs_at[i], run[i].lo, (size_t)(run[i].hi - run[i].lo));
+    for (a = 0; a < NV2A_RAW_ATTRS; a++) {
+        src[a] = (b->attr_direct & (1u << a)) ? b->direct[a].ptr : NULL;
+        if (b->attr_direct & (1u << a))
+            qb->direct[a].ptr = (const uint8_t *)(uintptr_t)
+                (runs_at[of_run[a]] + (size_t)(b->direct[a].ptr - run[of_run[a]].lo));
+    }
+    if (conv)
+        memcpy(rec + attrs_at, b->attrs, (size_t)b->vertex_count * NV2A_RAW_ATTRS * 16);
+    qb->attrs = (const float *)(uintptr_t)attrs_at;
+    memcpy(rec + idx_at, b->indices, (size_t)b->index_count * 4);
+    qb->indices = (const uint32_t *)(uintptr_t)idx_at;
+    ((QHdr *)rec)->size = (uint32_t)size;
+    q_publish(size);
+}
+
+static void q_clear(const Nv2aSurface *sf, const Nv2aRenderState *rs,
+                    uint32_t flags, uint32_t argb, uint32_t zs)
+{
+    uint32_t nreg = q_reg_collect();
+    size_t size = sizeof(QHdr) + (size_t)nreg * sizeof(QRegChunk) + Q_ALIGN(sizeof(QClear));
+    uint8_t *rec = q_reserve(size);
+    size_t at = q_write_state(rec, Q_CLEAR, 0, 0, NULL);
+    QClear *c = (QClear *)(rec + at);
+    c->s = *sf;
+    c->has_rs = rs != NULL;
+    if (rs)
+        c->rs = *rs;
+    c->flags = flags;
+    c->argb = argb;
+    c->zs = zs;
+    ((QHdr *)rec)->size = (uint32_t)size;
+    q_publish(size);
+}
+
+static void q_flip(void)
+{
+    uint32_t nreg;
+    size_t size;
+    uint8_t *rec;
+
+    /* No more than two frames behind the executor. */
+    if (__atomic_load_n(&s_q_flips, __ATOMIC_ACQUIRE) >= 2) {
+        uint64_t t0 = hz_now();
+        pthread_mutex_lock(&s_q_lock);
+        s_q_producer_waits = 1;
+        while (__atomic_load_n(&s_q_flips, __ATOMIC_ACQUIRE) >= 2)
+            q_timed_wait();
+        s_q_producer_waits = 0;
+        pthread_mutex_unlock(&s_q_lock);
+        __atomic_add_fetch(&s_q_exec_wait_ns, hz_now() - t0, __ATOMIC_RELAXED);
+    }
+    nreg = q_reg_collect();
+    size = sizeof(QHdr) + (size_t)nreg * sizeof(QRegChunk);
+    rec = q_reserve(size);
+    q_write_state(rec, Q_FLIP, 0, 0, NULL);
+    ((QHdr *)rec)->size = (uint32_t)size;
+    __atomic_add_fetch(&s_q_flips, 1, __ATOMIC_ACQ_REL);
+    q_publish(size);
+}
+
+static void *q_vk_thread(void *arg)
+{
+    extern void xbox_nx_pin_renderer(void);
+    extern void xbox_nx_track_thread(void *entry);
+    (void)arg;
+    xbox_nx_pin_renderer();
+    xbox_nx_track_thread((void *)q_vk_thread);
+    for (;;) {
+        size_t avail = __atomic_load_n(&s_q_head, __ATOMIC_SEQ_CST) - s_q_tail;
+        uint8_t *rec;
+        const QHdr *h;
+        size_t at;
+        uint32_t i;
+
+        if (!avail) {
+            uint64_t t0 = hz_now();
+            pthread_mutex_lock(&s_q_lock);
+            __atomic_store_n(&s_q_consumer_waits, 1, __ATOMIC_SEQ_CST);
+            while (__atomic_load_n(&s_q_head, __ATOMIC_SEQ_CST) == s_q_tail)
+                q_timed_wait();
+            __atomic_store_n(&s_q_consumer_waits, 0, __ATOMIC_SEQ_CST);
+            pthread_mutex_unlock(&s_q_lock);
+            __atomic_add_fetch(&s_q_idle_ns, hz_now() - t0, __ATOMIC_RELAXED);
+            continue;
+        }
+        rec = s_q + s_q_tail % Q_BYTES;
+        h = (const QHdr *)rec;
+        if (h->type != Q_WRAP) {
+            at = sizeof(QHdr);
+            for (i = 0; i < h->nreg; i++, at += sizeof(QRegChunk)) {
+                const QRegChunk *c = (const QRegChunk *)(rec + at);
+                memcpy(g_regs + c->idx * 16, c->w, 64);
+                s_q_dirty[c->idx] = 1;
+            }
+            for (i = 0; i < h->nprog; i++, at += sizeof(QRow)) {
+                const QRow *r = (const QRow *)(rec + at);
+                memcpy(g_prog[r->idx], r->w, 16);
+            }
+            for (i = 0; i < h->nconst; i++, at += sizeof(QRow)) {
+                const QRow *r = (const QRow *)(rec + at);
+                memcpy(g_consts[r->idx], r->w, 16);
+            }
+            s_regs = g_regs;                    /* what clears/presents read */
+            if (h->type == Q_DRAW) {
+                Nv2aRawBatch bb = *(const Nv2aRawBatch *)(rec + at);
+                uint32_t a;
+                bb.regs = g_regs;
+                bb.vp_program = (const uint32_t (*)[4])g_prog;
+                bb.vp_consts = (const float (*)[4])g_consts;
+                for (a = 0; a < NV2A_RAW_ATTRS; a++)
+                    if (bb.attr_direct & (1u << a))
+                        bb.direct[a].ptr = rec + (uintptr_t)bb.direct[a].ptr;
+                bb.attrs = (const float *)(rec + (uintptr_t)bb.attrs);
+                bb.indices = (const uint32_t *)(rec + (uintptr_t)bb.indices);
+                s_q_src = (const uint8_t *const *)(rec + at + Q_ALIGN(sizeof(Nv2aRawBatch)));
+                vk_draw_raw(&bb);
+                s_q_src = NULL;
+            } else if (h->type == Q_CLEAR) {
+                const QClear *c = (const QClear *)(rec + at);
+                vk_clear(&c->s, c->has_rs ? &c->rs : NULL, c->flags, c->argb, c->zs);
+            } else if (h->type == Q_FLIP) {
+                vk_flip();
+                __atomic_sub_fetch(&s_q_flips, 1, __ATOMIC_ACQ_REL);
+            }
+        }
+        __atomic_store_n(&s_q_tail, s_q_tail + h->size, __ATOMIC_SEQ_CST);
+        if (__atomic_load_n(&s_q_producer_waits, __ATOMIC_SEQ_CST)) {
+            pthread_mutex_lock(&s_q_lock);
+            pthread_cond_broadcast(&s_q_cv);
+            pthread_mutex_unlock(&s_q_lock);
+        }
+    }
+    return NULL;
+}
+
+/* Share of the last `secs` the recording thread sat idle and the executor
+ * was held back by the queue; -1 when the thread is off. */
+void nv2a_gl_queue_stats(double secs, int *gl_idle_pct, int *exec_wait_pct)
+{
+    if (!s_q_on) {
+        *gl_idle_pct = *exec_wait_pct = -1;
+        return;
+    }
+    *gl_idle_pct = (int)(__atomic_exchange_n(&s_q_idle_ns, 0, __ATOMIC_RELAXED) / (secs * 1e7));
+    *exec_wait_pct = (int)(__atomic_exchange_n(&s_q_exec_wait_ns, 0, __ATOMIC_RELAXED) / (secs * 1e7));
+}
+
+static int q_start(void)
+{
+    pthread_t t;
+    pthread_attr_t at;
+    s_q = (uint8_t *)malloc(Q_BYTES + 256);
+    if (!s_q)
+        return 0;
+    pthread_attr_init(&at);
+    pthread_attr_setstacksize(&at, 1u << 20);
+    if (pthread_create(&t, &at, q_vk_thread, NULL) != 0) {
+        free(s_q);
+        s_q = NULL;
+        return 0;
+    }
+    pthread_detach(t);
+    return 1;
+}
+
+static const Nv2aBackend s_backend_q = {
+    q_clear,
+    NULL,
+    q_flip,
+    q_draw,
+    NV2A_BACKEND_RAW_DIRECT,
+};
 
 static void vk_draw(const Nv2aSurface *s, const Nv2aBatch *b)
 {
@@ -4004,6 +4765,15 @@ static const Nv2aBackend s_backend = {
 
 void nv2a_vk_install(void)
 {
+    {
+        const char *e = getenv("RECOMP_VK_THREAD");
+        s_q_on = e && *e == '1' && q_start();
+    }
+    if (s_q_on) {
+        nv2a_backend_register(&s_backend_q);
+        fprintf(stderr, "[BOOT] NV2A Vulkan renderer registered, recording on a thread of its own\n");
+        return;
+    }
     nv2a_backend_register(&s_backend);
     fprintf(stderr, "[BOOT] NV2A Vulkan renderer registered\n");
 }

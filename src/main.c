@@ -422,6 +422,10 @@ static int game_main(void)
     xbox_kernel_init();
     /* text patch: NFSU2 only */
     nfsu1_options_load();
+    {
+        void nfsu1_extras_init(void);    /* nfsu1_extras.c: timer watchdog, R3 */
+        nfsu1_extras_init();
+    }
     xbox_path_init(game_dir, NFSU2_DEFAULT_SAVE_DIR);
     xbox_kernel_bridge_init();
 

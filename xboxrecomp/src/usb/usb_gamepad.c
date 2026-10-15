@@ -468,6 +468,10 @@ int usb_gamepad_connected(int dev)
         || xbox_InputGetState((DWORD)dev, &state) == 0;
 }
 
+/* Called with every report's digital buttons (byte 2) before it goes out,
+ * for a title to take a button for itself (NFSU1's R3 next song). */
+void (*usb_gamepad_report_hook)(int dev, uint8_t *digital);
+
 int usb_gamepad_report(int dev, uint8_t *out, int max)
 {
     XBOX_INPUT_STATE state;
@@ -520,6 +524,8 @@ int usb_gamepad_report(int dev, uint8_t *out, int max)
     if (xbox_InputGetState((DWORD)dev, &state) != 0) {
         out[2] = synth;
         pad_script(dev, &out[2], &out[4]);
+        if (usb_gamepad_report_hook)
+            usb_gamepad_report_hook(dev, &out[2]);
         return 20;
     }
 
@@ -537,6 +543,8 @@ int usb_gamepad_report(int dev, uint8_t *out, int max)
     out[18] = (uint8_t)(g->sThumbRY & 0xFF);
     out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
     pad_script(dev, &out[2], &out[4]);
+    if (usb_gamepad_report_hook)
+        usb_gamepad_report_hook(dev, &out[2]);
     return 20;
 }
 

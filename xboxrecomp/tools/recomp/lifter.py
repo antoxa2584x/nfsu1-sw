@@ -3249,16 +3249,20 @@ class Lifter:
             if nops >= 2:
                 src = _fmt_operand_read(ops[1])
                 return [_sse_write(ops[0], f"(float)(int32_t){src}") + " /* cvtsi2ss */"]
+        # Through SSE_CVT_F2I, not a C cast: out of range a cast is UB and
+        # differs between x86 and ARM hosts, and cvtss2si rounds.
         if m in ("cvtss2si", "cvttss2si"):
             if nops >= 2:
-                return [_fmt_operand_write(ops[0], f"(int32_t){_sse_read(ops[1])}") + f" /* {m} */"]
+                trunc = 1 if m.startswith("cvtt") else 0
+                return [_fmt_operand_write(ops[0], f"SSE_CVT_F2I({_sse_read(ops[1])}, {trunc})") + f" /* {m} */"]
         if m == "cvtsi2sd":
             if nops >= 2:
                 src = _fmt_operand_read(ops[1])
                 return [_sse_write(ops[0], f"(double)(int32_t){src}") + " /* cvtsi2sd */"]
         if m in ("cvtsd2si", "cvttsd2si"):
             if nops >= 2:
-                return [_fmt_operand_write(ops[0], f"(int32_t){_sse_read(ops[1])}") + f" /* {m} */"]
+                trunc = 1 if m.startswith("cvtt") else 0
+                return [_fmt_operand_write(ops[0], f"SSE_CVT_F2I({_sse_read(ops[1])}, {trunc})") + f" /* {m} */"]
         if m == "cvtss2sd":
             if nops >= 2:
                 return [_sse_write(ops[0], f"(double){_sse_read(ops[1])}") + " /* cvtss2sd */"]

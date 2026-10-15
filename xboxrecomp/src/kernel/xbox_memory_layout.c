@@ -988,12 +988,30 @@ int nv2a_exec_busy_percent(void) { return s_exec_busy_pct; }
  * them. While held, the PGRAPH status is left alone. */
 static volatile LONG g_nv2a_intr_hold;
 
+/* An ack pass that sampled "not held" could still clear a trap published
+ * after the sample, while the guest handler reads it. The hold changes and
+ * each ack pass are serialised. */
+static volatile LONG g_nv2a_intr_guard;
+
+static void nv2a_intr_lock(void)
+{
+    while (InterlockedCompareExchange(&g_nv2a_intr_guard, 1, 0) != 0)
+        Sleep(0);
+}
+
+static void nv2a_intr_unlock(void)
+{
+    InterlockedExchange(&g_nv2a_intr_guard, 0);
+}
+
 void xbox_Nv2aHoldInterrupts(int on)
 {
+    nv2a_intr_lock();
     if (on)
         InterlockedIncrement(&g_nv2a_intr_hold);
     else
         InterlockedDecrement(&g_nv2a_intr_hold);
+    nv2a_intr_unlock();
 }
 
 /* The vblank bits, likewise. The runtime raises vblank on the timer thread:
@@ -1073,6 +1091,7 @@ static int vblank_held(void)
 
 static void nv2a_ack_flags(volatile uint32_t *regs)
 {
+    nv2a_intr_lock();
     int held = InterlockedCompareExchange(&g_nv2a_intr_hold, 0, 0) != 0;
     int vblank = vblank_held();
 
@@ -1105,6 +1124,7 @@ static void nv2a_ack_flags(volatile uint32_t *regs)
             *r |= NV2A_IDLE[i].idle_mask;
         }
     }
+    nv2a_intr_unlock();
 }
 
 /* Busy/idle flags, on a thread of their own.
@@ -1206,7 +1226,9 @@ static DWORD WINAPI nv2a_flag_thread(LPVOID param)
 
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
+    extern void xbox_nx_pin_executor(void);   /* win32_compat.c: core 1 (Switch) */
     volatile uint32_t *regs = (volatile uint32_t *)param;
+    xbox_nx_pin_executor();
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
         nv2a_ack_flags(regs);
         {
@@ -2937,8 +2959,13 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * (m + 1) * g_memory_size. */
         uint64_t tiled_lo = XBOX_TILED_BASE;
         uint64_t tiled_hi = tiled_lo + xbox_TiledApertureSize();
+        /* RECOMP_NO_MIRRORS=1: leave the wrap unmapped, as on a host that
+         * cannot alias memory (Horizon), so stray reads past the top of RAM
+         * fault here too. */
+        const char *no_mirrors = getenv("RECOMP_NO_MIRRORS");
+        int mirror_count = (no_mirrors && *no_mirrors == '1') ? 0 : XBOX_NUM_MIRRORS;
 
-        for (int m = 0; m < XBOX_NUM_MIRRORS; m++) {
+        for (int m = 0; m < mirror_count; m++) {
             uintptr_t mirror_base = (uintptr_t)g_memory_base +
                                     (uintptr_t)(m + 1) * g_memory_size;
             uint64_t guest_lo = (uint64_t)(m + 1) * g_memory_size;

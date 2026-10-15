@@ -1083,6 +1083,8 @@ static HANDLE bridge_take_handle(uint32_t token);
 
 void xbox_dir_forget(HANDLE h);   /* kernel_file.c */
 
+static void stream_note(HANDLE h, int closing);   /* the stuck report */
+
 static void bridge_NtClose(void)
 {
     uint32_t raw_handle = STACK_ARG(0);
@@ -1098,7 +1100,11 @@ static void bridge_NtClose(void)
     if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u) {
         HANDLE h = bridge_take_handle(raw_handle);
         if (h && h != INVALID_HANDLE_VALUE) {
+            extern volatile LONG xbox_open_files;
             xbox_dir_forget(h);          /* a directory's open enumeration */
+            stream_note(h, 1);
+            if (w32_handle_fd(h) >= 0)
+                InterlockedDecrement(&xbox_open_files);
             CloseHandle(h);
         }
     }
@@ -2183,6 +2189,11 @@ static void bridge_NtSetEvent(void)
 static void bridge_NtPulseEvent(void)
 {
     HANDLE handle = bridge_resolve_handle(STACK_ARG(0));
+    static unsigned calls;
+    /* Lossy by design, so worth seeing who relies on it. */
+    if (calls++ < 4)
+        fprintf(stderr, "  [KERNEL] NtPulseEvent(%08X) from %08X (call %u)\n",
+                STACK_ARG(0), g_xbox_kernel_caller, calls);
     if (handle) PulseEvent(handle);
     g_eax = 0;
 }
@@ -2889,6 +2900,22 @@ static long long vb_now_us(void)
 static long long     s_vb_next_us;                /* when the next vblank is due */
 static volatile LONG s_vb_count;                  /* vblanks delivered */
 
+/* Display vsync (RECOMP_VBLANK_VSYNC, Switch glue): the host's display
+ * calls xbox_vblank_vsync on each of its vsyncs, and while they keep coming
+ * (one in the last 100 ms) a guest vblank is delivered on each of them
+ * instead of on the timer above. The title's flips then land on the
+ * display's refresh rather than on a 59.94 Hz clock that slips a frame
+ * against the 60 Hz panel every 17 s. Without them the timer takes over. */
+static volatile LONG      s_vsync_pending;
+static volatile LONG      s_vsync_count;
+static volatile long long s_vsync_last_us;
+
+/* Vblanks delivered so far (the renderer's frame pacing). */
+uint32_t xbox_vblank_count(void)
+{
+    return (uint32_t)s_vb_count;
+}
+
 /* For the fps reports: "vblank 59.9 Hz" since the previous call, dt s ago. */
 void xbox_vblank_report(double dt, char *buf, size_t n)
 {
@@ -2919,14 +2946,23 @@ static void kernel_vblank_tick(void)
         return;
 
     now = vb_now_us();
-    if (!s_vb_next_us)
-        s_vb_next_us = now;
-    if (now < s_vb_next_us)
-        return;
-    if (now - s_vb_next_us > VBLANK_PERIOD_US / 2)
-        s_vb_next_us = now + VBLANK_PERIOD_US;    /* far behind: restart here */
-    else
-        s_vb_next_us += VBLANK_PERIOD_US;         /* on time: no drift */
+    if (s_vsync_last_us && now - s_vsync_last_us < 100000) {
+        static int locked;
+        if (!InterlockedExchange(&s_vsync_pending, 0))
+            return;                               /* no vsync since the last one */
+        s_vb_next_us = now + VBLANK_PERIOD_US;    /* the timer's fallback */
+        if (!locked++)
+            fprintf(stderr, "  [NV2A] vblank locked to the display's vsync\n");
+    } else {
+        if (!s_vb_next_us)
+            s_vb_next_us = now;
+        if (now < s_vb_next_us)
+            return;
+        if (now - s_vb_next_us > VBLANK_PERIOD_US / 2)
+            s_vb_next_us = now + VBLANK_PERIOD_US;    /* far behind: restart here */
+        else
+            s_vb_next_us += VBLANK_PERIOD_US;         /* on time: no drift */
+    }
     InterlockedIncrement(&s_vb_count);
 
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
@@ -2964,6 +3000,15 @@ static void kernel_vblank_tick(void)
  * alone). The timer thread below services them. */
 HANDLE   xbox_irq_line_event(void);
 uint32_t xbox_irq_lines(void);
+
+/* A display vsync happened (any thread): wake the timer thread for it. */
+void xbox_vblank_vsync(void)
+{
+    s_vsync_last_us = vb_now_us();
+    InterlockedIncrement(&s_vsync_count);
+    InterlockedExchange(&s_vsync_pending, 1);
+    SetEvent(xbox_irq_line_event());
+}
 
 static void kernel_service_irqs(void)
 {
@@ -3226,7 +3271,10 @@ static void bridge_KeInitializeTimerEx(void)
  * audio off a timer. A title that needs better wants the host's timer queue,
  * not a smaller sleep.
  */
-#define XBOX_MAX_TIMERS 32
+/* NFSU1 keeps more than 32 armed at once during an autosave (music, streams,
+ * the multimedia timers): the 33rd was dropped and its waiter slept for good.
+ * The most ever armed together goes to the stuck report. */
+#define XBOX_MAX_TIMERS 128
 typedef struct {
     uint32_t timer_va;      /* the guest KTIMER, 0 for a free slot */
     uint32_t dpc_va;
@@ -3236,6 +3284,60 @@ typedef struct {
 static XboxTimer g_timers[XBOX_MAX_TIMERS];
 static CRITICAL_SECTION g_timer_lock;
 static int g_timer_started;
+static int g_timer_most;                /* most armed at once (stuck report) */
+
+/* Expire slot i if due: retire or reschedule it and signal it, all under
+ * g_timer_lock, as kernel_set_timer resets the old signal under it before
+ * publishing. Resetting after the publish (as before) let a one-shot that
+ * expired in between lose its signal for good: its waiter (the title's
+ * multimedia clock, so autosave delays and music) never woke. From
+ * cherepavel/nfsu1-android a789cea. */
+/* RECOMP_TIMER_DROP_TEST=<s>: <s> seconds after the first timer, drop one
+ * firing of a one-shot timer with no DPC -- the lost signal the title's
+ * timer watchdog (nfsu1_extras.c) is there to catch. A test, nothing else. */
+static int kernel_timer_drop_test(long long now)
+{
+    static long long at = -1;
+    if (at < 0) {
+        const char *e = getenv("RECOMP_TIMER_DROP_TEST");
+        at = e && atoi(e) > 0 ? now + atoi(e) * 1000LL : 0;
+    }
+    if (!at || now < at)
+        return 0;
+    at = 0;
+    return 1;
+}
+
+static int kernel_timer_expire(int i, long long now, uint32_t *dpc)
+{
+    uint32_t fired;
+    HANDLE ev;
+
+    EnterCriticalSection(&g_timer_lock);
+    if (!g_timers[i].timer_va || now < g_timers[i].due_ms) {
+        LeaveCriticalSection(&g_timer_lock);
+        return 0;
+    }
+    fired = g_timers[i].timer_va;
+    *dpc = g_timers[i].dpc_va;
+    if (g_timers[i].period_ms > 0)
+        g_timers[i].due_ms = now + g_timers[i].period_ms;
+    else
+        g_timers[i].timer_va = 0;      /* one-shot, done */
+    if (!*dpc && g_timers[i].period_ms <= 0 && kernel_timer_drop_test(now)) {
+        LeaveCriticalSection(&g_timer_lock);
+        fprintf(stderr, "[timer] test: firing of %08X dropped\n", fired);
+        return 0;
+    }
+    /* Wake anyone parked on the timer's shadow event; a timer with no DPC is
+     * just a kernel sleep. */
+    ev = ke_shadow_lookup(fired);
+    BRIDGE_MEM32(fired + 4) = 1;       /* SignalState */
+    if (ev)
+        SetEvent(ev);
+    LeaveCriticalSection(&g_timer_lock);
+    return 1;
+}
 
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 {
@@ -3243,6 +3345,10 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 
     (void)unused;
     xbox_guest_pin(1);             /* DPCs and vblank: interrupt-like, guest core */
+    {
+        extern void xbox_nx_raise_timer_thread(void);   /* win32_compat.c */
+        xbox_nx_raise_timer_thread();
+    }
     if (slot < 0) {
         fprintf(stderr, "  [KERNEL] timer thread has no worker stack; "
                         "timer DPCs will not run\n");
@@ -3285,34 +3391,13 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         now = (long long)GetTickCount64();
 
         for (i = 0; i < XBOX_MAX_TIMERS; i++) {
-            uint32_t dpc, fired_va;
+            uint32_t dpc;
 
-            EnterCriticalSection(&g_timer_lock);
-            if (!g_timers[i].timer_va || now < g_timers[i].due_ms) {
-                LeaveCriticalSection(&g_timer_lock);
+            if (!kernel_timer_expire(i, now, &dpc))
                 continue;
-            }
-            fired_va = g_timers[i].timer_va;
-            dpc = g_timers[i].dpc_va;
-            if (g_timers[i].period_ms > 0)
-                g_timers[i].due_ms = now + g_timers[i].period_ms;
-            else
-                g_timers[i].timer_va = 0;      /* one-shot, done */
-            LeaveCriticalSection(&g_timer_lock);
-
             /* Outside the lock: the routine can set or cancel timers. */
             if (dpc)
                 kernel_run_dpc(dpc, 0, 0);
-
-            /* Wake anyone parked on the timer's shadow event; a timer with no
-             * DPC is just a kernel sleep. */
-            {
-                HANDLE ev = ke_shadow_lookup(fired_va);
-                if (ev) {
-                    SetEvent(ev);
-                    BRIDGE_MEM32(fired_va + 4) = 1;   /* SignalState */
-                }
-            }
         }
         xbox_KfLowerIrql(PASSIVE_LEVEL);
     }
@@ -3338,18 +3423,28 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
         if (!g_timers[i].timer_va && free_slot < 0) free_slot = i;
     }
     if (free_slot >= 0) {
+        int armed = 0;
+        /* A freshly set timer starts unsignaled, like the real KeSetTimer --
+         * reset before it is visible to the expiry pass. */
+        HANDLE ev = ke_shadow_lookup(timer_va);
+        if (ev)
+            ResetEvent(ev);
+        BRIDGE_MEM32(timer_va + 4) = 0;
         g_timers[free_slot].timer_va  = timer_va;
         g_timers[free_slot].dpc_va    = dpc_va;
         g_timers[free_slot].due_ms    = (long long)GetTickCount64() + delay_ms;
         g_timers[free_slot].period_ms = period_ms;
+        for (i = 0; i < XBOX_MAX_TIMERS; i++)
+            armed += g_timers[i].timer_va != 0;
+        if (armed > g_timer_most)
+            g_timer_most = armed;
     }
     LeaveCriticalSection(&g_timer_lock);
-
-    /* A freshly set timer starts unsignaled, like the real KeSetTimer. */
-    {
-        HANDLE ev = ke_shadow_lookup(timer_va);
-        if (ev)
-            ResetEvent(ev);
+    if (free_slot < 0) {
+        static int told;
+        if (told++ < 16)
+            fprintf(stderr, "[timer] all %d timer slots armed: timer %08X (due %lld ms) dropped\n",
+                    XBOX_MAX_TIMERS, timer_va, delay_ms);
     }
     g_eax = was_set;
 }
@@ -3384,6 +3479,54 @@ int xbox_kernel_cancel_timer(uint32_t timer_va)
         }
     LeaveCriticalSection(&g_timer_lock);
     return was_set;
+}
+
+/* For a watchdog on a guest KTIMER: 1 armed here (*due_in_ms until it
+ * fires), 0 not armed, -1 no host event behind it. *signaled: its event is
+ * set (peeked: an auto-reset event consumed by the look is set again). */
+int xbox_kernel_timer_state(uint32_t timer_va, long long *due_in_ms, int *signaled)
+{
+    HANDLE ev = ke_shadow_lookup(timer_va);
+    int i, armed = 0;
+
+    *signaled = 0;
+    if (!ev)
+        return -1;
+    if (g_timer_started) {
+        EnterCriticalSection(&g_timer_lock);
+        for (i = 0; i < XBOX_MAX_TIMERS; i++)
+            if (g_timers[i].timer_va == timer_va) {
+                *due_in_ms = g_timers[i].due_ms - (long long)GetTickCount64();
+                armed = 1;
+            }
+        LeaveCriticalSection(&g_timer_lock);
+    }
+    if (WaitForSingleObject(ev, 0) == WAIT_OBJECT_0) {
+        *signaled = 1;
+        SetEvent(ev);
+    }
+    return armed;
+}
+
+/* Expire a guest KTIMER now: disarm it, signal it. Under the timer lock, as
+ * kernel_timer_expire does. */
+void xbox_kernel_timer_fire(uint32_t timer_va)
+{
+    HANDLE ev;
+    int i;
+
+    if (!ke_shadow_lookup(timer_va) || !g_timer_started)
+        return;
+    EnterCriticalSection(&g_timer_lock);
+    for (i = 0; i < XBOX_MAX_TIMERS; i++)
+        if (g_timers[i].timer_va == timer_va)
+            g_timers[i].timer_va = 0;
+    ev = ke_shadow_lookup(timer_va);
+    if (ev) {
+        SetEvent(ev);
+        BRIDGE_MEM32(timer_va + 4) = 1;   /* SignalState */
+    }
+    LeaveCriticalSection(&g_timer_lock);
 }
 
 /* ── ExQueryPoolBlockSize (ordinal 24) ────────────────────
@@ -4161,6 +4304,8 @@ static void bridge_NtReadFile(void)
     PLARGE_INTEGER poff = NULL;
 
     memset(&ios, 0, sizeof(ios));
+    if (handle)
+        stream_note(handle, 0);
     if (!bridge_buf_ok(buffer_va, length, "NtReadFile")) {
         bridge_write_iostatus(iostatus, (NTSTATUS)0xC0000005, 0);
         g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
@@ -10102,18 +10247,272 @@ static int kernel_call_keeps_gil(int slot)
         || ord == 160 || ord == 161;          /* KeRaiseIrqlTo*, KfRaise/LowerIrql */
 }
 
+/* ── Stuck report ─────────────────────────────────────────────────────
+ *
+ * A hang on the console is a black screen with music, or silence, and
+ * nothing in the log. Every guest thread's kernel call is recorded here
+ * (ordinal, first two arguments, call site, since when), and
+ * xbox_kernel_stuck_report -- every 10 s from the Switch glue's report, every
+ * 5 s on a thread of its own with RECOMP_STUCK_REPORT=1 -- names the threads
+ * that have sat in one for over 5 s, with the guest call chain (return
+ * addresses found on the guest stack). The first few waits are taken apart:
+ * each object's type and state, its host event, and for a timer whether the
+ * timer thread still has it armed. Also: music/stream files that stopped
+ * being read (with every thread's state at that moment), the most kernel
+ * timers ever armed at once, and the number of open files. */
+#define KCALL_SLOTS 32
+static struct {
+    volatile long long since_ms;        /* 0: not in a kernel call */
+    uint32_t tid, ordinal, arg0, caller, arg1;
+    uint32_t esp;                       /* guest esp at the call (0: no call yet) */
+} s_kcall[KCALL_SLOTS];
+static RECOMP_TLS int t_kcall_slot = -1;
+static volatile LONG s_kcall_next;
+
+void xbox_kernel_stuck_report(void);
+
+static DWORD WINAPI kernel_stuck_thread(LPVOID unused)
+{
+    (void)unused;
+    for (;;) {
+        Sleep(5000);
+        xbox_kernel_stuck_report();
+    }
+    return 0;
+}
+
+static int kcall_enter(int slot)
+{
+    static volatile LONG started;
+    int k = t_kcall_slot;
+
+    if (!InterlockedExchange(&started, 1)) {
+        const char *e = getenv("RECOMP_STUCK_REPORT");
+        if (e && *e == '1')
+            CloseHandle(CreateThread(NULL, 0, kernel_stuck_thread, NULL, 0, NULL));
+    }
+    if (k < 0) {
+        k = InterlockedIncrement(&s_kcall_next) - 1;
+        t_kcall_slot = k < KCALL_SLOTS ? k : KCALL_SLOTS;
+        if (k >= KCALL_SLOTS)
+            return -1;
+        s_kcall[k].tid = GetCurrentThreadId();
+    }
+    if (k >= KCALL_SLOTS)
+        return -1;
+    s_kcall[k].ordinal = (slot >= 0 && slot < XBOX_KERNEL_THUNK_TABLE_SIZE)
+                       ? g_slot_ordinals[slot] : 0;
+    s_kcall[k].caller = BRIDGE_MEM32(g_esp);
+    s_kcall[k].arg0 = BRIDGE_MEM32(g_esp + 4);
+    s_kcall[k].arg1 = BRIDGE_MEM32(g_esp + 8);
+    s_kcall[k].esp = g_esp;
+    s_kcall[k].since_ms = (long long)GetTickCount64();
+    return k;
+}
+
+/* " %X" for each dword in the 2 KB above esp that points into the title's
+ * code: the return addresses of the calls under way, and some noise. */
+static void kcall_chain(uint32_t esp, char *out, size_t n)
+{
+    size_t at = 0;
+    uint32_t a;
+    int found = 0;
+
+    out[0] = 0;
+    if (esp - 1 >= 0x3FFFFFEu)
+        return;
+    for (a = esp; a < esp + 0x800 && a <= 0x3FFFFFFu && found < 16; a += 4) {
+        uint32_t v = BRIDGE_MEM32(a);
+        if (v - 0x11000u > 0x1EEFFFu || at + 10 >= n)
+            continue;
+        at += (size_t)snprintf(out + at, n - at, " %X", v);
+        found++;
+    }
+}
+
 static void kernel_thunk_dispatch(void)
 {
+    int k;
     if (kernel_call_keeps_gil(g_kernel_dispatch_slot)) {
         kernel_thunk_dispatch_body();
         return;
     }
+    k = kcall_enter(g_kernel_dispatch_slot);
     int gil = xbox_gil_suspend();                /* the kernel is not guest code */
     pending_start_flush(GetCurrentThreadId());   /* threads this one created */
     xbox_kernel_busy(1);
     kernel_thunk_dispatch_body();
     xbox_kernel_busy(-1);
     xbox_gil_resume(gil);
+    if (k >= 0)
+        s_kcall[k].since_ms = 0;
+}
+
+/* Music and speech streams (paths with "streams" in them) and how they are
+ * read: a hang that silences the music shows up as a stream nobody reads. */
+#define KSTREAMS 8
+static struct {
+    HANDLE h;
+    long long last_ms, told_ms;
+    uint32_t reads;
+    char name[44];
+} s_kstream[KSTREAMS];
+
+static volatile LONG s_kstream_lock;
+
+static void stream_note_locked(HANDLE h, int closing);
+
+static void stream_note(HANDLE h, int closing)
+{
+    while (InterlockedCompareExchange(&s_kstream_lock, 1, 0))
+        Sleep(0);
+    stream_note_locked(h, closing);
+    InterlockedExchange(&s_kstream_lock, 0);
+}
+
+static void stream_note_locked(HANDLE h, int closing)
+{
+    int i, free_i = -1;
+    const char *path, *base;
+
+    for (i = 0; i < KSTREAMS; i++) {
+        if (s_kstream[i].h == h)
+            break;
+        if (!s_kstream[i].h && free_i < 0)
+            free_i = i;
+    }
+    if (i < KSTREAMS) {
+        if (closing) {
+            s_kstream[i].h = NULL;
+            return;
+        }
+        if (s_kstream[i].told_ms)
+            fprintf(stderr, "[stream] %s read again after %.0f s\n", s_kstream[i].name,
+                    ((long long)GetTickCount64() - s_kstream[i].last_ms) / 1000.0);
+        s_kstream[i].told_ms = 0;
+        s_kstream[i].last_ms = (long long)GetTickCount64();
+        s_kstream[i].reads++;
+        return;
+    }
+    if (closing || free_i < 0 || !(path = w32_handle_path(h))
+        || (!strstr(path, "streams") && !strstr(path, "STREAMS")))
+        return;
+    base = strrchr(path, '/');
+    snprintf(s_kstream[free_i].name, sizeof s_kstream[free_i].name, "%s", base ? base + 1 : path);
+    s_kstream[free_i].last_ms = (long long)GetTickCount64();
+    s_kstream[free_i].told_ms = 0;
+    s_kstream[free_i].h = h;
+    s_kstream[free_i].reads = 1;
+}
+
+extern volatile LONG xbox_open_files;       /* kernel_file.c */
+
+/* The objects a thread blocked in KeWaitFor*Object(s) is waiting on. */
+static void kcall_wait_objects(int k, long long now)
+{
+    uint32_t n = s_kcall[k].ordinal == 158 ? s_kcall[k].arg0 : 1, i;
+
+    for (i = 0; i < n && i < 8; i++) {
+        uint32_t va = s_kcall[k].ordinal == 158 ? BRIDGE_MEM32(s_kcall[k].arg1 + i * 4)
+                                                : s_kcall[k].arg0;
+        HANDLE ev;
+        int armed = 0, set = 0, t;
+        long long due = 0;
+        uint8_t type;
+
+        if (!va)
+            continue;
+        ev = ke_shadow_lookup(va);
+        type = BRIDGE_MEM8(va);
+
+        if (g_timer_started) {
+            EnterCriticalSection(&g_timer_lock);
+            for (t = 0; t < XBOX_MAX_TIMERS; t++)
+                if (g_timers[t].timer_va == va) {
+                    armed = 1;
+                    due = g_timers[t].due_ms - now;
+                }
+            LeaveCriticalSection(&g_timer_lock);
+        }
+        if (ev && WaitForSingleObject(ev, 0) == WAIT_OBJECT_0) {
+            set = 1;
+            SetEvent(ev);                   /* the peek took it */
+        }
+        fprintf(stderr, "[wait]   thread %u object %u: %08X type %u state %d, %s%s",
+                s_kcall[k].tid, i, va, type, (int)BRIDGE_MEM32(va + 4),
+                ev ? "host event " : "guest object", ev ? (set ? "signalled" : "clear") : "");
+        if ((type & 0xFE) == 8) {           /* a timer, notification or synchronization */
+            if (armed)
+                fprintf(stderr, ", timer armed, due in %lld ms\n", due);
+            else
+                fprintf(stderr, ", timer NOT armed\n");
+        } else {
+            fputc('\n', stderr);
+        }
+    }
+}
+
+void xbox_kernel_stuck_report(void)
+{
+    static int detailed, most_told;
+    static long files_told;
+    long long now = (long long)GetTickCount64();
+    char chain[200];
+    int k, n = InterlockedCompareExchange(&s_kcall_next, 0, 0), stream_stopped = 0, i;
+    long files;
+
+    if (n > KCALL_SLOTS)
+        n = KCALL_SLOTS;
+    for (k = 0; k < n; k++) {
+        long long t = s_kcall[k].since_ms;
+        if (!t || now - t <= 5000 || s_kcall[k].ordinal == 258)   /* PsTerminateSystemThread */
+            continue;
+        if ((s_kcall[k].ordinal == 158 || s_kcall[k].ordinal == 159) && detailed < 6) {
+            detailed++;
+            kcall_wait_objects(k, now);
+        }
+    }
+    for (k = 0; k < n; k++) {
+        long long t = s_kcall[k].since_ms;
+        if (!t || now - t <= 5000 || s_kcall[k].ordinal == 258)
+            continue;
+        kcall_chain(s_kcall[k].esp, chain, sizeof chain);
+        fprintf(stderr, "[wait] thread %u blocked %.0f s in kernel ordinal %u, first argument "
+                "%08X (called from %08X), chain%s\n", s_kcall[k].tid, (now - t) / 1000.0,
+                s_kcall[k].ordinal, s_kcall[k].arg0, s_kcall[k].caller, chain);
+    }
+    for (i = 0; i < KSTREAMS; i++) {
+        if (!s_kstream[i].h || s_kstream[i].reads <= 3 || now - s_kstream[i].last_ms < 15000)
+            continue;
+        if (s_kstream[i].told_ms && now - s_kstream[i].told_ms <= 60000)
+            continue;
+        fprintf(stderr, "[stream] %s: no read for %.0f s (%u reads before)\n", s_kstream[i].name,
+                (now - s_kstream[i].last_ms) / 1000.0, s_kstream[i].reads);
+        s_kstream[i].told_ms = now;
+        stream_stopped = 1;
+    }
+    if (stream_stopped) {
+        fprintf(stderr, "[wait] guest threads (%s):\n", "a stream stopped");
+        for (k = 0; k < n; k++) {
+            long long t = s_kcall[k].since_ms;
+            if (!s_kcall[k].esp || (t && s_kcall[k].ordinal == 258))
+                continue;
+            kcall_chain(s_kcall[k].esp, chain, sizeof chain);
+            /* A running thread's chain is from its last kernel call. */
+            fprintf(stderr, "[wait]   thread %u: %s ordinal %u for %.1f s, chain%s\n",
+                    s_kcall[k].tid, t ? "in" : "running, last", s_kcall[k].ordinal,
+                    t ? (now - t) / 1000.0 : 0.0, chain);
+        }
+    }
+    if (g_timer_most != most_told) {
+        most_told = g_timer_most;
+        fprintf(stderr, "[timer] at most %d kernel timers armed at once\n", most_told);
+    }
+    files = xbox_open_files;
+    if (files > files_told + 3 || files < files_told - 3) {
+        fprintf(stderr, "[files] %ld open\n", files);
+        files_told = files;
+    }
 }
 
 static void kernel_thunk_dispatch_body(void)

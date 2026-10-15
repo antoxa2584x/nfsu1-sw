@@ -62,6 +62,7 @@
 #include <math.h>
 #if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
 #include <xmmintrin.h>
+#include <emmintrin.h>   /* SSE_CVT_F2I: _mm_cvt[t]sd_si32 */
 #endif
 
 /* MSVC's __forceinline -> gcc/clang equivalent on POSIX. */
@@ -1218,6 +1219,25 @@ static inline int32_t MMX_CVT_F2I(float v, int truncate)
                     : _mm_cvtss_si32(_mm_set_ss(v));
 #else
     double rounded = truncate ? trunc((double)v) : nearbyint((double)v);
+    if (!(rounded >= -2147483648.0 && rounded <= 2147483647.0))
+        return (int32_t)0x80000000u;       /* integer indefinite */
+    return (int32_t)rounded;
+#endif
+}
+
+/* Scalar cvt[t]ss2si / cvt[t]sd2si. A plain C cast is undefined out of
+ * range and differs by host: x86 gives the integer indefinite 0x80000000,
+ * AArch64's fcvtzs saturates and turns NaN into 0. NFSU1's SpaceCadet grid
+ * fed such a value into a cell index on the Switch only. cvtss2si also
+ * rounds (MXCSR, nearest by default) where a cast truncates. Floats widen to
+ * double exactly, so one helper covers both widths. */
+static inline int32_t SSE_CVT_F2I(double v, int truncate)
+{
+#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
+    return truncate ? _mm_cvttsd_si32(_mm_set_sd(v))
+                    : _mm_cvtsd_si32(_mm_set_sd(v));
+#else
+    double rounded = truncate ? trunc(v) : nearbyint(v);
     if (!(rounded >= -2147483648.0 && rounded <= 2147483647.0))
         return (int32_t)0x80000000u;       /* integer indefinite */
     return (int32_t)rounded;

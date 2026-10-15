@@ -279,6 +279,9 @@ typedef struct w32_object {
     /* event */
     int             signaled;
     int             manual_reset;
+    int             ev_waiters;     /* threads blocked in wait_single */
+    unsigned        pulse_gen;      /* PulseEvent count */
+    int             pulse_tokens;   /* wake-ups the last pulse handed out */
 
     /* semaphore */
     long            sem_count;
@@ -327,6 +330,7 @@ typedef struct w32_object {
     int             fd;
     SIZE_T          map_size;
     char           *file_path;
+    int             delete_on_close;   /* NT delete disposition: at last close */
 } w32_object;
 
 /* pseudo handles for "current thread"/"current process" */
@@ -450,6 +454,13 @@ static void obj_release(w32_object *o)
     reg_remove(o);
     if (o->kind == K_FILE) {
         if (o->fd >= 0) close(o->fd);
+        /* Deleted only now that the handle is closed: Horizon refuses to
+         * delete a file or directory that is still open. A directory (a save
+         * game's folder, after XDK removed its files) goes by rmdir. */
+        if (o->delete_on_close && o->file_path && unlink(o->file_path) != 0
+            && rmdir(o->file_path) != 0)
+            fprintf(stderr, "  [FILE] delete on close of %s failed, errno %d\n",
+                    o->file_path, errno);
         free(o->file_path);
     } else if (o->kind == K_FILEMAP) {
         if (o->fd >= 0) close(o->fd);
@@ -481,6 +492,13 @@ const char *w32_handle_path(HANDLE h)
 {
     w32_object *o = obj_from(h);
     return (o && o->kind == K_FILE) ? o->file_path : NULL;
+}
+
+void w32_handle_delete_on_close(HANDLE h, int on)
+{
+    w32_object *o = obj_from(h);
+    if (o && o->kind == K_FILE)
+        o->delete_on_close = on;
 }
 
 BOOL CloseHandle(HANDLE h)
@@ -576,11 +594,19 @@ static DWORD wait_single(w32_object *o, DWORD ms)
 
     pthread_mutex_lock(&o->lock);
     DWORD result = WAIT_OBJECT_0;
+    unsigned pulse_gen = o->pulse_gen;
+    int waiting = 0;
 
     for (;;) {
         int ready = 0;
         switch (o->kind) {
-        case K_EVENT:  ready = o->signaled; break;
+        case K_EVENT:
+            ready = o->signaled;
+            if (!ready && waiting && o->pulse_gen != pulse_gen && o->pulse_tokens > 0) {
+                o->pulse_tokens--;             /* woken by a PulseEvent */
+                ready = 2;
+            }
+            break;
         case K_THREAD: ready = o->exited;   break;
         case K_SEM:    ready = (o->sem_count > 0); break;
         case K_MUTEX:
@@ -590,6 +616,10 @@ static DWORD wait_single(w32_object *o, DWORD ms)
         default:       ready = 1; break;
         }
         if (ready) break;
+        if (o->kind == K_EVENT && !waiting) {
+            waiting = 1;
+            o->ev_waiters++;
+        }
 
         /* An armed timer has its own deadline. Waiting on the caller's alone
          * would sleep straight past the due time, so take whichever comes
@@ -608,9 +638,11 @@ static DWORD wait_single(w32_object *o, DWORD ms)
         }
     }
 
+    if (waiting)
+        o->ev_waiters--;
     if (result == WAIT_OBJECT_0) {
         switch (o->kind) {
-        case K_EVENT: if (!o->manual_reset) o->signaled = 0; break;
+        case K_EVENT: if (!o->manual_reset && o->signaled) o->signaled = 0; break;
         case K_WAITABLE_TIMER:
             if (!o->waitable_manual_reset) { o->waitable_triggered = 0; o->waitable_armed = 0; }
             break;
@@ -734,10 +766,17 @@ BOOL PulseEvent(HANDLE h)
 {
     w32_object *o = obj_from(h);
     if (!o || o->kind != K_EVENT) return FALSE;
+    /* Wakes the threads waiting right now -- one for an auto-reset event,
+     * all for a manual-reset one -- and leaves the event unsignaled. Setting
+     * and clearing `signaled` around the broadcast woke nobody: a waiter
+     * re-tests it only after taking the lock back, by when it was 0 again,
+     * so a title that pulses its worker events waited for good. */
     pthread_mutex_lock(&o->lock);
-    o->signaled = 1;
-    pthread_cond_broadcast(&o->cond);
-    o->signaled = 0;
+    if (o->ev_waiters > 0) {
+        o->pulse_gen++;
+        o->pulse_tokens = o->manual_reset ? o->ev_waiters : 1;
+        pthread_cond_broadcast(&o->cond);
+    }
     pthread_mutex_unlock(&o->lock);
     return TRUE;
 }
@@ -911,15 +950,45 @@ void xbox_nx_raise_host_thread(void)
 }
 
 #if defined(__SWITCH__)
+/* ── Dedicated cores for the renderer (RECOMP_NX_PIN) ─────────────────
+ *
+ * In a race the pushbuffer executor and the Vulkan recording thread
+ * (RECOMP_VK_THREAD) are the two busiest threads, and both used to float
+ * over cores 0-2 at the time-sliced priority 59 beside the guest threads,
+ * losing 10 ms slices to them. Pinned, the executor has core 1 to itself
+ * and the Vulkan thread core 2, both at 0x3A (above 59, so never sliced
+ * away), and every other spread thread keeps to cores 0 and 2. On unless
+ * RECOMP_NX_PIN=0, and off with RECOMP_GUEST_ONE_CORE, which hands out
+ * cores itself. */
+static int nx_pin_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_NX_PIN");
+        on = (e && *e == '0') ? 0 : xbox_guest_core() < 0;
+    }
+    return on;
+}
+
+static u64 nx_core_mask(void)
+{
+    u64 mask = 0;
+    if (R_FAILED(svcGetInfo(&mask, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0)))
+        return 0;
+    return mask;
+}
+
 void xbox_nx_spread_thread(void)
 {
     static int next = 1;                 /* core 0 is the loader's main thread */
-    u64 mask = 0;
+    u64 mask = nx_core_mask();
     int k, core;
 
-    if (R_FAILED(svcGetInfo(&mask, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0)))
+    if (!mask)
         return;
     mask &= 0x7u;
+    if (nx_pin_on() && (mask & 5u) == 5u)
+        mask &= ~2ull;                   /* core 1 is the executor's */
     if (xbox_guest_core() >= 0 && (mask & ~(1u << xbox_guest_core())))
         mask &= ~(1u << xbox_guest_core());   /* that core is the guest's */
     if (!mask || !(mask & (mask - 1)))
@@ -932,7 +1001,46 @@ void xbox_nx_spread_thread(void)
     for (core = 0; core < 3; core++)
         if (((mask >> core) & 1u) && k-- == 0)
             break;
+    if (nx_pin_on() && mask == 5u)
+        core = 2;                        /* ideal core 2: core 0 runs the guest */
     svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, (u32)mask);
+}
+
+/* The pushbuffer executor: core 1 alone, priority 0x3A. */
+void xbox_nx_pin_executor(void)
+{
+    if (!nx_pin_on() || !(nx_core_mask() & 2u))
+        return;
+    if (R_FAILED(svcSetThreadCoreMask(CUR_THREAD_HANDLE, 1, 1u << 1)))
+        return;
+    svcSetThreadPriority(CUR_THREAD_HANDLE, 0x3A);
+    fprintf(stderr, "  [NX] pushbuffer executor on core 1 alone (priority 0x3A)\n");
+}
+
+/* The Vulkan recording thread: core 2, priority 0x3A; spread otherwise. */
+void xbox_nx_pin_renderer(void)
+{
+    if (!nx_pin_on() || !(nx_core_mask() & 4u)) {
+        xbox_nx_spread_thread();
+        return;
+    }
+    if (R_FAILED(svcSetThreadCoreMask(CUR_THREAD_HANDLE, 2, 1u << 2)))
+        return;
+    svcSetThreadPriority(CUR_THREAD_HANDLE, 0x3A);
+    fprintf(stderr, "  [NX] Vulkan recording thread on core 2 (priority 0x3A)\n");
+}
+
+/* The kernel timer thread raises vblank and runs DPCs: interrupt work.
+ * At 59 it waited behind guest threads for whole 10 ms slices, and the
+ * guest's vblank and timer clocks stalled with it. 0x2C, as the audio
+ * thread; RECOMP_NX_TIMER_PRIO=0 leaves it at 59. */
+void xbox_nx_raise_timer_thread(void)
+{
+    const char *e = getenv("RECOMP_NX_TIMER_PRIO");
+    if (e && *e == '0')
+        return;
+    if (R_SUCCEEDED(svcSetThreadPriority(CUR_THREAD_HANDLE, 0x2C)))
+        fprintf(stderr, "  [NX] kernel timer thread (vblank, DPCs) at priority 0x2C\n");
 }
 
 
@@ -1021,6 +1129,9 @@ void xbox_nx_thread_report(double interval_s)
 }
 #else
 void xbox_nx_spread_thread(void) { }
+void xbox_nx_pin_executor(void) { }
+void xbox_nx_pin_renderer(void) { }
+void xbox_nx_raise_timer_thread(void) { }
 void xbox_nx_track_thread(void *entry) { (void)entry; }
 void xbox_nx_retag_thread(void *entry) { (void)entry; }
 #endif

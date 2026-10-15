@@ -41,6 +41,7 @@ file(GLOB RECOMP_GEN_SOURCES CONFIGURE_DEPENDS "${NFSU2_GEN_DIR}/*.c")
 
 set(GAME_SOURCES
     src/main.c
+    src/nfsu1_extras.c
     src/recomp_manual.c
     src/switch_nx.c
     src/switch_saltynx.c
@@ -103,11 +104,14 @@ else()
     # NFSU2_LTO_JOBS parallel LTRANS jobs (memory: ~1-2 GB each).
     option(NFSU2_LTO "Link-time optimisation of the lifted code" OFF)
     set(NFSU2_LTO_JOBS "4" CACHE STRING "Parallel LTO link jobs")
-    set(NFSU2_GEN_FLAGS "${NFSU2_GEN_OPT};-w;-fno-strict-aliasing;-fwrapv")
+    # -ffp-contract=off: x86 rounds every SSE mul and add; GCC on AArch64
+    # fuses a*b+c into fmadd by default, so the Switch computed different
+    # floats from the same guest code.
+    set(NFSU2_GEN_FLAGS "${NFSU2_GEN_OPT};-w;-fno-strict-aliasing;-fwrapv;-ffp-contract=off")
     if(NFSU2_LTO)
         list(APPEND NFSU2_GEN_FLAGS "-flto=auto")
         set_property(SOURCE src/recomp_manual.c APPEND PROPERTY
-            COMPILE_OPTIONS "-flto=auto;-fno-strict-aliasing;-fwrapv")
+            COMPILE_OPTIONS "-flto=auto;-fno-strict-aliasing;-fwrapv;-ffp-contract=off")
         target_link_options(${PROJECT_NAME} PRIVATE
             "-flto=${NFSU2_LTO_JOBS}" "-flto-partition=balanced" ${NFSU2_GEN_OPT})
     endif()
