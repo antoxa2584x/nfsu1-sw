@@ -1026,6 +1026,211 @@ void sub_0011BC20(void)
     esp += 4;                                   /* ret */
 }
 
+/* ── Boot: load the saved profile without the questions ─────
+ *
+ * NFSU1_AUTOLOAD=1 (default off). Read from the NTSC-U XBE, not run yet:
+ *
+ *   0x286195 (byte) is 1 from boot (set at 0x000A652F) until the first
+ *   login is over. While it is, MU_Main's constructor sub_000AB510 opens
+ *   GenericDialog A (YES 0xF770 -> 0xFEDCBA00, NO 0x61C -> 0xFEDCBA01, NO
+ *   highlighted); after YES its handler sub_000AAE80 opens dialog B
+ *   (0xC6CA43B1 -> 0xFEDCBA02: MU_PlayerLogin mode 1, a new profile through
+ *   the name keyboard; 0x6A9B74BD -> 0xFEDCBA03: mode 3, load,
+ *   sub_000BC070(package, 0xFEDCBA04)).
+ *   Mode 3 is UserProfileScreen (state function at this+0x3C, entry flag
+ *   this+0x44): sub_000BE1D0 -> sub_000BDFF0 lists the saves -> sub_000BDA60
+ *   (none: "no saved game", back) -> sub_000BD7E0, the list (0x406415E3
+ *   takes the highlighted name into this+0x65, 0x911C0A4B moves down one)
+ *   -> sub_000BCD20 "load %s?" (YES = 0x12312300) -> sub_000BE210 loads it
+ *   and returns to MU_Main, which clears 0x286195.
+ *
+ * Here, when a save is on the card (game/UDATA/45410047/<id>/<name>.nfs,
+ * where \Device\Harddisk0\Partition1 lands), dialog A is not opened and
+ * MU_Main gets 0xFEDCBA03 as if YES then Load had been chosen; the list
+ * takes the most recently written save; "load %s?" is answered YES. With no
+ * save the questions come as before, and anything the memory card code asks
+ * (damaged save, ...) is still asked. */
+#include <dirent.h>
+#include <sys/stat.h>
+#include <strings.h>
+#include <time.h>
+
+#define NFSU1_LOGIN_PENDING 0x00286195u
+#define FE_TICK             0xC98356BAu     /* every frame */
+#define FE_SHOWN            0x35F8620Bu     /* package on screen */
+#define FE_LIST_ACCEPT      0x406415E3u
+#define FE_LIST_DOWN        0x911C0A4Bu
+#define MAIN_MSG_LOAD       0xFEDCBA03u     /* dialog B's Load */
+#define LOGIN_MSG_YES       0x12312300u
+#define LOGIN_STATE_LIST    0x000BD7E0u
+#define AUTOLOAD_RET_VA     ROW_HANDLER_VA  /* int3 padding, never run */
+
+enum { AL_OFF, AL_MAIN, AL_LIST, AL_CONFIRM };
+static int s_al_stage, s_al_checked;
+static uint32_t s_al_main;
+static char s_al_name[32];              /* newest save's profile */
+
+/* Newest <name>.nfs under game/UDATA/45410047/<id>/: its name, and how
+ * many there are. */
+static int autoload_find_save(void)
+{
+    const char *game = getenv("NFSU2_GAME_DIR");
+    char dir[600], sub[700], path[800];
+    struct dirent *u, *s, *f;
+    DIR *du, *ds, *df;
+    time_t best = 0;
+    int count = 0;
+
+#if defined(__SWITCH__)
+    if (!game || !*game) game = "sdmc:/switch/nfsu1x/game";
+#else
+    if (!game || !*game) game = "game";
+#endif
+    if (!(du = opendir(game)))
+        return 0;
+    while ((u = readdir(du))) {                 /* UDATA, any case */
+        if (strcasecmp(u->d_name, "UDATA"))
+            continue;
+        snprintf(dir, sizeof dir, "%s/%s/45410047", game, u->d_name);
+        if (!(ds = opendir(dir)))
+            continue;
+        while ((s = readdir(ds))) {             /* one folder per save */
+            if (s->d_name[0] == '.')
+                continue;
+            snprintf(sub, sizeof sub, "%s/%s", dir, s->d_name);
+            if (!(df = opendir(sub)))
+                continue;
+            while ((f = readdir(df))) {
+                size_t n = strlen(f->d_name);
+                struct stat st;
+                if (n < 5 || n - 4 >= sizeof s_al_name ||
+                    strcasecmp(f->d_name + n - 4, ".nfs"))
+                    continue;
+                snprintf(path, sizeof path, "%s/%s", sub, f->d_name);
+                if (stat(path, &st) != 0)
+                    continue;
+                count++;
+                if (st.st_mtime >= best) {
+                    best = st.st_mtime;
+                    memcpy(s_al_name, f->d_name, n - 4);
+                    s_al_name[n - 4] = 0;
+                }
+            }
+            closedir(df);
+        }
+        closedir(ds);
+    }
+    closedir(du);
+    return count;
+}
+
+/* A thiscall state/handler with its four arguments (callee pops them). */
+static void autoload_call(void (*fn)(void), uint32_t self, uint32_t msg)
+{
+    PUSH32(esp, 0);
+    PUSH32(esp, 0);
+    PUSH32(esp, 0);
+    PUSH32(esp, msg);
+    PUSH32(esp, AUTOLOAD_RET_VA);
+    ecx = self;
+    fn();
+}
+
+extern void sub_000AB510_gen(void);
+extern void sub_000AAE80_gen(void);
+extern void sub_000BD7E0_gen(void);
+extern void sub_000BCD20_gen(void);
+
+/* MU_Main constructor (thiscall, 1 argument). */
+void sub_000AB510(void)
+{
+    uint32_t self = ecx;
+    int take = 0;
+
+    if (!s_al_checked && MEM8(NFSU1_LOGIN_PENDING) == 1) {
+        const char *e = getenv("NFSU1_AUTOLOAD");
+        s_al_checked = 1;
+        if (e && e[0] == '1') {
+            int n = autoload_find_save();
+            fprintf(stderr, "[autoload] %d save(s)%s%s\n", n,
+                    n ? ", newest " : "", n ? s_al_name : "");
+            take = n > 0;
+        }
+    }
+    if (take)
+        MEM8(NFSU1_LOGIN_PENDING) = 0;          /* no dialog A */
+    sub_000AB510_gen();
+    if (take) {
+        MEM8(NFSU1_LOGIN_PENDING) = 1;          /* login still under way */
+        s_al_main = self;
+        s_al_stage = AL_MAIN;
+    }
+}
+
+/* MU_Main's message handler (thiscall, 4 arguments). */
+void sub_000AAE80(void)
+{
+    uint32_t self = ecx, msg = MEM32(esp + 4u);
+
+    sub_000AAE80_gen();
+    if (s_al_stage == AL_MAIN && self == s_al_main &&
+        (msg == FE_SHOWN || msg == FE_TICK)) {
+        s_al_stage = AL_LIST;
+        autoload_call(sub_000AAE80_gen, self, MAIN_MSG_LOAD);
+    }
+}
+
+/* The save list: one frame after it is shown, take the newest save. */
+void sub_000BD7E0(void)
+{
+    uint32_t self = ecx, msg = MEM32(esp + 4u);
+    int entering = MEM8(self + 0x44u);
+
+    sub_000BD7E0_gen();
+    if (s_al_stage != AL_LIST || entering || msg != FE_TICK ||
+        MEM8(NFSU1_LOGIN_PENDING) != 1 || MEM32(self + 0x3Cu) != LOGIN_STATE_LIST)
+        return;
+    s_al_stage = AL_OFF;
+    {
+        uint32_t list = MEM32(self + 0xA8u), i, n, stride, data, pick = 0;
+
+        if (!list)
+            return;
+        stride = MEM32(list);
+        n = MEM32(list + 8u);
+        data = MEM32(list + 0xCu);
+        if (!n || !stride || !data)
+            return;
+        for (i = 0; i < n; i++)
+            if (strncasecmp((const char *)XBOX_PTR(data + i * stride), s_al_name,
+                            sizeof s_al_name - 1) == 0) {
+                pick = i;
+                break;
+            }
+        fprintf(stderr, "[autoload] list of %u, taking %u (%s)\n", n, pick,
+                (const char *)XBOX_PTR(data + pick * stride));
+        for (i = 0; i < pick; i++)
+            autoload_call(sub_000BD7E0_gen, self, FE_LIST_DOWN);
+        s_al_stage = AL_CONFIRM;
+        autoload_call(sub_000BD7E0_gen, self, FE_LIST_ACCEPT);
+    }
+}
+
+/* "Load <profile>?": YES without showing it. */
+void sub_000BCD20(void)
+{
+    uint32_t self = ecx;
+
+    if (s_al_stage == AL_CONFIRM && MEM8(self + 0x44u) &&
+        MEM32(esp + 4u) == FE_TICK && MEM8(NFSU1_LOGIN_PENDING) == 1) {
+        s_al_stage = AL_OFF;
+        MEM8(self + 0x44u) = 0;                 /* the dialog is not opened */
+        MEM32(esp + 4u) = LOGIN_MSG_YES;        /* its YES */
+        fprintf(stderr, "[autoload] loading the profile\n");
+    }
+    sub_000BCD20_gen();
+}
+
 /* ── Manual function overrides ─────────────────────────────── */
 
 /*
