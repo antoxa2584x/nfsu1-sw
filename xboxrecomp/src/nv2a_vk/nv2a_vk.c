@@ -3497,7 +3497,7 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
 
     if (!ready())
         return;
-    if (flare_fix_skip(b, s_frame))   /* FLARE_FIX */
+    if (flare_fix_draw(&b, &r, s_frame))   /* FLARE_FIX */
         return;                       /* FLARE_FIX */
     s_regs = r;
     s_batch = b;
@@ -4173,6 +4173,8 @@ static void dump_fxaa(VkSurf *s, const char *path)
  * elsewhere: the call is skipped. */
 extern void nv2a_host_frame_presented(uint32_t width, uint32_t height) __attribute__((weak));
 
+#include "flare_glare.h"   /* FLARE_FIX */
+
 static void vk_flip(void)
 {
     static int dump_every = -1;
@@ -4265,6 +4267,7 @@ static void vk_flip(void)
     end_rendering();
     s_rt = NULL;
     s_rt_depth = NULL;
+    flare_glare(s);   /* FLARE_FIX */
     {
         int pct = nv2a_vk_scale_pct;
         double k = pct < 50 ? 0.0 : pct > 400 ? 4.0 : pct / 100.0;
