@@ -70,6 +70,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include "flare_fix.h"   /* FLARE_FIX */
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -3496,6 +3497,8 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
 
     if (!ready())
         return;
+    if (flare_fix_skip(b, s_frame))   /* FLARE_FIX */
+        return;                       /* FLARE_FIX */
     s_regs = r;
     s_batch = b;
     if (s_inst_on < 0) {
