@@ -40,6 +40,11 @@
  *                                    (default -0.25: a little sharper)
  *   RECOMP_VK_FXAA=0                 present with a plain blit, no FXAA
  *   RECOMP_VK_FXAA_SUBPIX=<s>        FXAA sub-pixel smoothing 0..1 (0.25)
+ *   RECOMP_VK_SSAA=<k>               supersampling: surfaces at k times the
+ *                                    render scale (1..2, default 1 = off),
+ *                                    filtered down in the present pass
+ *   RECOMP_VK_CUBE_UP=<m>            car reflection cube faces at m times the
+ *                                    render scale (1..4, default 1 = off)
  *   RECOMP_VK_VALIDATION=1           (Linux) enable the Khronos validation layer
  *   RECOMP_VK_HEADLESS=1             (Linux) no window, no present
  */
@@ -65,6 +70,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include "flare_fix.h"   /* FLARE_FIX */
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -310,6 +316,10 @@ typedef struct {
  * RECOMP_VK_SQUARE=0 off; RECOMP_GL_SCALE_X overrides it. */
 static double   s_scale = 1.0, s_scale_x = 1.0, s_xratio = 1.0;
 static int      s_square, s_square_env;
+/* RECOMP_VK_SSAA: every surface's stored size times this on top of the scale
+ * (the game's menu and RECOMP_GL_SCALE keep their meaning); the present pass
+ * filters it down to the output (present_fxaa, mode 1/2). */
+static double   s_ssaa = 1.0;
 
 /* Picture options set at run time (NFSU2: Options -> Video), read by the
  * renderer: FXAA on/off (at every present), anisotropic level 1..16 (per
@@ -326,11 +336,55 @@ static uint32_t s_max_size = 4096;
  * flip (rescale_surfaces). */
 volatile int nv2a_vk_scale_pct;
 
-/* The stored size of a w x h surface at the current scale, capped per axis
- * by the device's image limits. */
-static void stored_size(uint32_t w, uint32_t h, uint32_t aa_sx, uint32_t *pw, uint32_t *ph)
+/* RECOMP_VK_CUBE_UP=<m> (default 1 = off, up to 4): the faces of a
+ * render-to-cube reflection map (the car reflections) get m times the render
+ * scale -- sharper reflections. A surface becomes a face when a cube map is
+ * bound over its address (cube_note_face); the next flip rebuilds it
+ * (rescale_surfaces) and cube_from_surfaces sizes the cube from it. */
+static double   s_cube_up = -1.0;
+static uint32_t s_cube_va[32];
+static int      s_ncube_va, s_cube_pending;
+static int cube_face_va(uint32_t va)
 {
-    double kx = s_scale_x * (s_square && aa_sx <= 1 ? 4.0 / 3.0 : 1.0), ky = s_scale;
+    int i;
+    for (i = 0; i < s_ncube_va; i++)
+        if (s_cube_va[i] == va) return 1;
+    return 0;
+}
+static void cube_up_init(void)
+{
+    const char *e = getenv("RECOMP_VK_CUBE_UP");
+    s_cube_up = e ? atof(e) : 1.0;
+    if (!(s_cube_up > 1.0)) s_cube_up = 1.0;
+    if (s_cube_up > 4.0) s_cube_up = 4.0;
+    fprintf(stderr, "  [VK] reflection cube faces at %gx the render scale (RECOMP_VK_CUBE_UP)%s\n",
+            s_cube_up, s_cube_up > 1.0 ? "" : ", off");
+}
+static void cube_note_face(uint32_t va)
+{
+    if (s_cube_up < 0.0) cube_up_init();
+    if (s_cube_up <= 1.0 || cube_face_va(va) || s_ncube_va >= 32) return;
+    s_cube_va[s_ncube_va++] = va;
+    s_cube_pending = 1;
+}
+/* vk_flip: faces found since the last flip need rebuilding (rescale_surfaces). */
+static int cube_resize_due(void)
+{
+    int r = s_cube_pending;
+    s_cube_pending = 0;
+    return r;
+}
+
+/* The stored size of a w x h surface at the current scale (times RECOMP_VK_SSAA,
+ * and RECOMP_VK_CUBE_UP for a reflection face), capped per axis by the
+ * device's image limits. */
+static void stored_size(uint32_t va, uint32_t w, uint32_t h, uint32_t aa_sx, uint32_t *pw, uint32_t *ph)
+{
+    double sxk = s_scale_x * s_ssaa, syk = s_scale * s_ssaa, kx, ky;
+    if (cube_face_va(va)) {                 /* only listed with CUBE_UP set */
+        sxk *= s_cube_up; syk *= s_cube_up;
+    }
+    kx = sxk * (s_square && aa_sx <= 1 ? 4.0 / 3.0 : 1.0); ky = syk;
     if (w * kx > (double)s_max_size)
         kx = (double)s_max_size / w;
     if (h * ky > (double)s_max_size)
@@ -745,7 +799,7 @@ static VkSurf *surf_get(uint32_t va, uint32_t w, uint32_t h, uint32_t aa_sx, uin
     memset(s, 0, sizeof *s);
     s->va = va; s->w = w; s->h = h; s->used = s_frame;
     s->aa_sx = aa_sx; s->aa_sy = aa_sy;
-    stored_size(w, h, aa_sx, &s->pw, &s->ph);
+    stored_size(va, w, h, aa_sx, &s->pw, &s->ph);
     if (!make_image(s->pw, s->ph, VK_FORMAT_B8G8R8A8_UNORM,
                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
@@ -781,7 +835,7 @@ static void rescale_surfaces(double k)
         uint32_t pw, ph;
         if (!s->image)
             continue;
-        stored_size(s->w, s->h, s->aa_sx, &pw, &ph);
+        stored_size(s->va, s->w, s->h, s->aa_sx, &pw, &ph);
         if (pw == s->pw && ph == s->ph)
             continue;
         if (!make_image(pw, ph, VK_FORMAT_B8G8R8A8_UNORM,
@@ -1347,6 +1401,8 @@ static VkImageView cube_from_surfaces(uint32_t va, uint32_t w, uint32_t h, uint3
             LOGE("cube 0x%08X %ux%u from surfaces (stored %u)\n", va, w, h, size);
     }
     c->used = s_frame;
+    for (f = 0; f < 6; f++)
+        if (faces[f]) cube_note_face(faces[f]->va);
     for (f = 0; f < 6; f++) {
         VkSurf *sf = faces[f];
         VkImageBlit bl;
@@ -2509,6 +2565,11 @@ static int ready(void)
         if (s_scale != 1.0 || s_scale_x != 1.0 || s_square)
             fprintf(stderr, "  [VK] rendering at %g x %g (RECOMP_GL_SCALE[_X])%s, surfaces up to %u\n",
                     s_scale_x, s_scale, s_square ? ", square pixels" : "", s_max_size);
+        e = getenv("RECOMP_VK_SSAA");
+        k = e ? strtod(e, NULL) : 1.0;
+        s_ssaa = !(k > 1.0) ? 1.0 : k > 2.0 ? 2.0 : k;  /* 4 taps filter at most 2:1 */
+        fprintf(stderr, "  [VK] SSAA %gx (RECOMP_VK_SSAA)%s\n", s_ssaa,
+                s_ssaa > 1.0 ? ": surfaces at that times the scale, filtered down at present" : ", off");
     }
     if (s_ubo_align < 16) s_ubo_align = 16;
     vkGetPhysicalDeviceMemoryProperties(s_pd, &s_memprops);
@@ -2530,6 +2591,7 @@ static int ready(void)
             s_aniso = 1.0f;
         if (s_aniso > pp.limits.maxSamplerAnisotropy)
             s_aniso = pp.limits.maxSamplerAnisotropy;
+        cube_up_init();                     /* boot line; else at the first cube */
     }
     {
         VkFormatProperties fp;
@@ -3435,6 +3497,8 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
 
     if (!ready())
         return;
+    if (flare_fix_draw(&b, &r, s_frame))   /* FLARE_FIX */
+        return;                       /* FLARE_FIX */
     s_regs = r;
     s_batch = b;
     if (s_inst_on < 0) {
@@ -3808,6 +3872,7 @@ static VkDescriptorSetLayout s_pp_dsl;
 static VkPipelineLayout      s_pp_layout;
 static VkSampler             s_pp_sampler;
 static struct { VkFormat fmt; VkPipeline pipe; } s_pp[2];
+static int                   s_pp_failed;
 
 static const char s_pp_vs[] =
     "#version 450\n"
@@ -3825,15 +3890,14 @@ static const char s_pp_fs[] =
     "float Lat(vec2 uv) { return L(textureLod(src, uv, 0.0).rgb); }\n"
     "#define LO(x, y) L(textureLodOffset(src, uv, 0.0, ivec2(x, y)).rgb)\n"
     "const float Q[8] = float[](1.0, 1.0, 1.0, 1.5, 2.0, 2.0, 4.0, 8.0);\n"
-    "void main() {\n"
-    "    vec2 uv = (gl_FragCoord.xy - pc.rect.xy) / pc.rect.zw;\n"
+    "vec3 fx(vec2 uv) {\n"
     "    vec2 r = pc.rcp.xy;\n"
     "    vec4 cM = textureLod(src, uv, 0.0);\n"
     "    float lM = L(cM.rgb), lD = LO(0, 1), lU = LO(0, -1), lL = LO(-1, 0), lR = LO(1, 0);\n"
     "    float mx = max(lM, max(max(lD, lU), max(lL, lR)));\n"
     "    float mn = min(lM, min(min(lD, lU), min(lL, lR)));\n"
     "    float range = mx - mn;\n"
-    "    if (range < max(0.0312, mx * 0.125)) { o = vec4(cM.rgb, 1.0); return; }\n"
+    "    if (range < max(0.0312, mx * 0.125)) return cM.rgb;\n"
     "    float lDL = LO(-1, 1), lUR = LO(1, -1), lUL = LO(-1, -1), lDR = LO(1, 1);\n"
     "    float lDU = lD + lU, lLR = lL + lR;\n"
     "    float lLc = lDL + lUL, lDc = lDL + lDR, lRc = lDR + lUR, lUc = lUR + lUL;\n"
@@ -3872,7 +3936,18 @@ static const char s_pp_fs[] =
     "    float s2 = (-2.0 * s1 + 3.0) * s1 * s1;\n"
     "    fin = max(fin, s2 * s2 * pc.rcp.z);\n"
     "    if (hor) uv.y += fin * step; else uv.x += fin * step;\n"
-    "    o = vec4(textureLod(src, uv, 0.0).rgb, 1.0);\n"
+    "    return textureLod(src, uv, 0.0).rgb;\n"
+    "}\n"
+    /* rcp.w: 0 FXAA (as before SSAA); 1 SSAA, FXAA in the surface's texels at
+     * each tap; 2 SSAA, plain taps. Four bilinear taps at +-1/4 output pixel:
+     * an exact 2x2 box at 2:1, a tent over the footprint below that. */
+    "vec3 tap(vec2 uv) { return pc.rcp.w > 1.5 ? textureLod(src, uv, 0.0).rgb : fx(uv); }\n"
+    "void main() {\n"
+    "    vec2 uv = (gl_FragCoord.xy - pc.rect.xy) / pc.rect.zw;\n"
+    "    if (pc.rcp.w == 0.0) { o = vec4(fx(uv), 1.0); return; }\n"
+    "    vec2 h = 0.25 / pc.rect.zw;\n"
+    "    o = vec4(0.25 * (tap(uv - h) + tap(uv + h) + tap(uv + vec2(h.x, -h.y))\n"
+    "                     + tap(uv + vec2(-h.x, h.y))), 1.0);\n"
     "}\n";
 
 static int fxaa_on(void)
@@ -3910,6 +3985,8 @@ static VkPipeline pp_pipe(VkFormat fmt)
     for (i = 0; i < 2; i++)
         if (s_pp[i].pipe && s_pp[i].fmt == fmt)
             return s_pp[i].pipe;
+    if (s_pp_failed)                        /* SSAA calls in with FXAA off: build once */
+        return VK_NULL_HANDLE;
     if (!s_pp_layout) {
         VkDescriptorSetLayoutBinding b = { 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
                                            VK_SHADER_STAGE_FRAGMENT_BIT, NULL };
@@ -3976,6 +4053,7 @@ static VkPipeline pp_pipe(VkFormat fmt)
     if (!pipe) {
         LOGE("FXAA pipeline failed; presenting with a blit\n");
         s_fxaa = 0;
+        s_pp_failed = 1;
         return VK_NULL_HANDLE;
     }
     i = s_pp[0].pipe ? 1 : 0;
@@ -4001,8 +4079,15 @@ static int present_fxaa(VkSurf *s, VkImage dst, VkImageView dview, VkFormat fmt,
     VkRect2D sc = { { dx, dy }, { (uint32_t)dw, (uint32_t)dh } };
     VkDescriptorImageInfo ii;
     VkWriteDescriptorSet wr = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-    float pc[8];
+    float pc[8], mode = 0.0f;
 
+    /* SSAA and the surface is taller than the output: filter it down, FXAA'd
+     * per tap below 2:1; at 2:1 and up a pixel has 4 samples and FXAA on top
+     * would only blur. Not larger (a low scale): FXAA or the blit as before. */
+    if (s_ssaa > 1.0 && s->ph > (uint32_t)dh)
+        mode = fxaa_on() && s->ph < 2u * (uint32_t)dh ? 1.0f : 2.0f;
+    else if (!fxaa_on())
+        return 0;
     if (!pipe || !dview)
         return 0;
     end_rendering();
@@ -4040,7 +4125,8 @@ static int present_fxaa(VkSurf *s, VkImage dst, VkImageView dview, VkFormat fmt,
     p_push_desc(s_cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pp_layout, 0, 1, &wr);
     pc[0] = (float)dx; pc[1] = (float)dy; pc[2] = (float)dw; pc[3] = (float)dh;
     pc[4] = 1.0f / (float)s->pw; pc[5] = 1.0f / (float)s->ph;
-    pc[6] = s_fxaa_subpix; pc[7] = 0.0f;
+    pc[6] = s_fxaa_subpix;
+    pc[7] = mode;
     vkCmdPushConstants(s_cb, s_pp_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, pc);
     vkCmdDraw(s_cb, 3, 1, 0, 0);
     p_end_rendering(s_cb);
@@ -4059,12 +4145,13 @@ static int present_fxaa(VkSurf *s, VkImage dst, VkImageView dview, VkFormat fmt,
 static void dump_fxaa(VkSurf *s, const char *path)
 {
     static VkSurf t;
-    if (t.image && (t.pw != s->pw || t.ph != s->ph)) {
+    uint32_t pw = (uint32_t)(s->pw / s_ssaa + 0.5), ph = (uint32_t)(s->ph / s_ssaa + 0.5);
+    if (t.image && (t.pw != pw || t.ph != ph)) {
         garbage_add(t.image, t.view, t.mem);
         memset(&t, 0, sizeof t);
     }
     if (!t.image) {
-        t.pw = s->pw; t.ph = s->ph;
+        t.pw = pw; t.ph = ph;
         if (!make_image(t.pw, t.ph, VK_FORMAT_B8G8R8A8_UNORM,
                         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                         VK_IMAGE_ASPECT_COLOR_BIT, &t.image, &t.view, &t.mem)) {
@@ -4085,6 +4172,8 @@ static void dump_fxaa(VkSurf *s, const char *path)
  * overlays), with the rendered picture's size. Weak and undefined
  * elsewhere: the call is skipped. */
 extern void nv2a_host_frame_presented(uint32_t width, uint32_t height) __attribute__((weak));
+
+#include "flare_glare.h"   /* FLARE_FIX */
 
 static void vk_flip(void)
 {
@@ -4178,13 +4267,14 @@ static void vk_flip(void)
     end_rendering();
     s_rt = NULL;
     s_rt_depth = NULL;
+    flare_glare(s);   /* FLARE_FIX */
     {
         int pct = nv2a_vk_scale_pct;
         double k = pct < 50 ? 0.0 : pct > 400 ? 4.0 : pct / 100.0;
         int sq = s_square_env && nv2a_vk_square;
         if (!(k > 0.0))
             k = s_scale;
-        if (k != s_scale || sq != s_square) {
+        if (k != s_scale || sq != s_square || cube_resize_due()) {
             s_square = sq;
             rescale_surfaces(k);
         }
@@ -4194,7 +4284,7 @@ static void vk_flip(void)
         char path[320];
         snprintf(path, sizeof path, "%s%05u.bmp", dump_prefix, s_frame);
         dump_surface(s, path);
-        if (s_headless && fxaa_on()) {
+        if (s_headless && (fxaa_on() || s_ssaa > 1.0)) {
             snprintf(path, sizeof path, "%s%05u_fxaa.bmp", dump_prefix, s_frame);
             barrier_all();
             dump_fxaa(s, path);
@@ -4228,7 +4318,7 @@ static void vk_flip(void)
                 dw = (int)(lw * scale); dh = (int)(lh * scale);
                 dx = ((int)ww - dw) / 2; dy = ((int)wh - dh) / 2;
             }
-            if (dw > 0 && dh > 0 && fxaa_on()
+            if (dw > 0 && dh > 0 && (fxaa_on() || s_ssaa > 1.0)
                 && present_fxaa(s, dst, s_sc_views[idx], s_sc_format, s_sc_extent, dx, dy, dw, dh,
                                 VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                                 VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT))
