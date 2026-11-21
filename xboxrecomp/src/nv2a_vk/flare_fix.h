@@ -14,11 +14,16 @@
  * leaves its decaying copies twice as close together: they overlap into a
  * bigger, brighter blob -- oncoming headlights most of all.
  *
- * RECOMP_FLARE_FIX=1 runs steps 1-3 once per 33.3 ms of real time (every
- * second frame at 60 fps, every frame at 30 fps or slower) and skips them
- * otherwise; step 4 runs every frame. The buffer then evolves exactly as on
- * a 30 fps Xbox. =2 updates on every second frame regardless of time (test
- * mode for slow hosts). Default 0: behaviour unchanged.
+ * RECOMP_FLARE_FIX=1: steps 1-3 run every frame (the newest flare is always
+ * this frame's, so the halo sits on the lamp: no judder), and the decay
+ * colour is set per frame from the real frame time, k_frame =
+ * k'^(dt / 33.3 ms) per channel (k' below; 2.5 ms <= dt <= 100 ms), so the
+ * trail lasts the same time at any frame rate.
+ * =3 (the first version, kept for A/B): steps 1-3 once per 33.3 ms of real
+ * time and skipped otherwise, step 4 every frame. At 60 fps the halo is
+ * 16 ms old on every second frame and the cadence follows vsync jitter --
+ * with a short trail that flickers. =2: as 3, every second frame regardless
+ * of time (slow hosts). Default 0: behaviour unchanged.
  *
  * Trail shape (with the fix on; only the decay colour of step 1 changes, no
  * extra pass, the newest flare keeps full intensity). A copy left n updates
@@ -54,11 +59,12 @@
 #define FLARE_FIX_PERIOD 0.0333333   /* the Xbox's 30 fps, seconds */
 #define FLARE_FIX_DECAY  0x008296B4u /* the title's decay colour (0x153B4) */
 
-static int      s_ff_mode = -1;      /* RECOMP_FLARE_FIX: 0 off, 1 33.3 ms, 2 every 2nd frame */
+static int      s_ff_mode = -1;      /* RECOMP_FLARE_FIX: 0 off, 1 per frame, 2 every 2nd frame, 3 33.3 ms */
 static int      s_ff_glare;          /* RECOMP_FLARE_GLARE: 0 off, 1 on, 2 even frames only (flare_glare.h) */
 static uint32_t s_ff_trail_va;       /* the trail surface, once seen */
 static uint32_t s_ff_trail_frame = ~0u;   /* frame of its last decay pass */
 static uint32_t s_ff_decay = FLARE_FIX_DECAY;
+static double   s_ff_k[3];           /* k' per channel (B, G, R) per 33.3 ms */
 
 static double flare_fix_now(void)
 {
@@ -70,7 +76,7 @@ static double flare_fix_now(void)
 static void flare_fix_init(void)
 {
     const char *e = getenv("RECOMP_FLARE_FIX");
-    s_ff_mode = e && (*e == '1' || *e == '2') ? *e - '0' : 0;
+    s_ff_mode = e && *e >= '1' && *e <= '3' ? *e - '0' : 0;
     e = getenv("RECOMP_FLARE_GLARE");
     s_ff_glare = e && (*e == '1' || *e == '2') ? *e - '0' : 0;
     if (s_ff_mode) {
@@ -89,10 +95,13 @@ static void flare_fix_init(void)
         s_ff_decay = 0;
         for (i = 0; i < 24; i += 8) {
             double k = ((FLARE_FIX_DECAY >> i) & 0xFF) / 255.0;
-            s_ff_decay |= (uint32_t)lround(255.0 * o * pow(k, 1.0 / t)) << i;
+            s_ff_k[i / 8] = o * pow(k, 1.0 / t);
+            s_ff_decay |= (uint32_t)lround(255.0 * s_ff_k[i / 8]) << i;
         }
-        fprintf(stderr, "[flare] trail updates at 30 Hz (%s), length x%.2f, opacity %.2f (decay %08X -> %08X)\n",
-                s_ff_mode == 1 ? "33.3 ms" : "every 2nd frame", t, o, FLARE_FIX_DECAY, s_ff_decay);
+        fprintf(stderr, "[flare] trail %s, length x%.2f, opacity %.2f (decay %08X -> %08X per 33.3 ms)\n",
+                s_ff_mode == 1 ? "updated every frame, decay from frame time"
+                : s_ff_mode == 3 ? "updated at 30 Hz (33.3 ms)" : "updated every 2nd frame",
+                t, o, FLARE_FIX_DECAY, s_ff_decay);
     }
 }
 
@@ -121,6 +130,15 @@ static int flare_fix_draw(const Nv2aRawBatch **pb, const uint32_t **pr, uint32_t
             if (s_ff_mode == 2) {
                 tick = !tick;
             } else if (s_ff_mode == 1) {
+                double dt = last ? now - last : FLARE_FIX_PERIOD;
+                int i;
+                last = now;
+                dt = dt < 0.0025 ? 0.0025 : dt > 0.1 ? 0.1 : dt;
+                s_ff_decay = 0;
+                for (i = 0; i < 3; i++)
+                    s_ff_decay |= (uint32_t)lround(255.0 * pow(s_ff_k[i], dt / FLARE_FIX_PERIOD)) << (8 * i);
+                tick = 1;
+            } else if (s_ff_mode == 3) {
                 acc = last ? acc + (now - last) : FLARE_FIX_PERIOD;
                 last = now;
                 tick = acc >= FLARE_FIX_PERIOD;
