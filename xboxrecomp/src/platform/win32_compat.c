@@ -1992,13 +1992,24 @@ BOOL VirtualProtect(LPVOID address, SIZE_T size, DWORD newProtect, PDWORD oldPro
 /* 100-ns intervals between 1601-01-01 and 1970-01-01 */
 #define FILETIME_EPOCH_DIFF 116444736000000000ULL
 
+/* RECOMP_FAST_TIME=1: QueryPerformanceCounter, GetTickCount(64) and
+ * GetSystemTimeAsFileTime from one TSC-based clock (fast_time.h). Off: the
+ * clock_gettime code below, unchanged. */
+#include "fast_time.h"
+void recomp_fast_time_init(void) { ft_init(); }
+
 VOID GetSystemTimeAsFileTime(LPFILETIME ft)
 {
     struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ULONGLONG t = FILETIME_EPOCH_DIFF
-                + (ULONGLONG)ts.tv_sec * 10000000ULL
-                + (ULONGLONG)ts.tv_nsec / 100ULL;
+    ULONGLONG t;
+    if (ft_active()) {
+        t = FILETIME_EPOCH_DIFF + ft_wall_ns() / 100ULL;
+    } else {
+        clock_gettime(CLOCK_REALTIME, &ts);
+        t = FILETIME_EPOCH_DIFF
+          + (ULONGLONG)ts.tv_sec * 10000000ULL
+          + (ULONGLONG)ts.tv_nsec / 100ULL;
+    }
     ft->dwLowDateTime  = (DWORD)(t & 0xFFFFFFFFULL);
     ft->dwHighDateTime = (DWORD)(t >> 32);
 }
@@ -2034,6 +2045,8 @@ VOID GetLocalTime(LPSYSTEMTIME st)
 ULONGLONG GetTickCount64(void)
 {
     struct timespec ts;
+    if (ft_active())
+        return ft_now_ns() / 1000000ULL;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (ULONGLONG)ts.tv_sec * 1000ULL + (ULONGLONG)ts.tv_nsec / 1000000ULL;
 }
@@ -2043,6 +2056,10 @@ DWORD GetTickCount(void) { return (DWORD)GetTickCount64(); }
 BOOL QueryPerformanceCounter(PLARGE_INTEGER count)
 {
     struct timespec ts;
+    if (ft_active()) {
+        count->QuadPart = (LONGLONG)ft_now_ns();
+        return TRUE;
+    }
     clock_gettime(CLOCK_MONOTONIC, &ts);
     count->QuadPart = (LONGLONG)ts.tv_sec * 1000000000LL + ts.tv_nsec;
     return TRUE;

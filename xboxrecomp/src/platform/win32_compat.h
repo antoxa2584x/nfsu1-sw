@@ -219,6 +219,7 @@ DWORD GetTickCount(void);
 ULONGLONG GetTickCount64(void);
 BOOL  QueryPerformanceCounter(PLARGE_INTEGER count);
 BOOL  QueryPerformanceFrequency(PLARGE_INTEGER freq);
+void  recomp_fast_time_init(void);   /* RECOMP_FAST_TIME, fast_time.h; once, env final */
 
 /* ---- Misc ------------------------------------------------------------- */
 VOID  OutputDebugStringA(LPCSTR str);

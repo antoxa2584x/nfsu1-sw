@@ -590,6 +590,9 @@ static int gil_enabled(void)
         const char *e = getenv("RECOMP_GIL");
         InitializeCriticalSection(&s_gil_cs);
         InitializeConditionVariable(&s_gil_cv);
+#if !defined(_WIN32)
+        recomp_fast_time_init();          /* before any guest code reads a clock */
+#endif
         s_gil_on = !(e && *e == '0');
         if (s_gil_on)
             fprintf(stderr, "  [THREAD] guest code serialised under one lock (RECOMP_GIL)\n");
