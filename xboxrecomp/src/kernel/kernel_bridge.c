@@ -3630,7 +3630,12 @@ static const char* bridge_get_xbox_path(uint32_t obj_attrs_va)
     if (!buf_va) return NULL;
     /* XDK directory searches pass a counted prefix of "directory\\*".
      * The byte after Length need not be NUL or part of the object name. */
-    static RECOMP_TLS char path[65536];
+    /* Heap, not a 64 KB TLS array: native static TLS would give every host
+     * thread (audio, GPU, RADV workers) this buffer.
+     * shortcut: never freed at thread exit (64 KB per exited thread that
+     * opened a path), free it from the thread-exit path if threads churn. */
+    static RECOMP_TLS char *path;
+    if (!path && !(path = malloc(65536))) return NULL;
     uint16_t length=BRIDGE_MEM16(ansi_str_va);
     if(length>BRIDGE_MEM16(ansi_str_va+2)) return NULL;
     /* Length <= MaximumLength says the string is self-consistent; it does not
