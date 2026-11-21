@@ -158,13 +158,39 @@ static void install_crash_reporter(void)
 static void install_crash_reporter(void) {}
 #else
 #include <execinfo.h>
+#include <pthread.h>
+#include <time.h>
+#ifdef __PROSPERO__
+#  include <sys/ucontext.h>
+#endif
+
+/* The real log file behind stderr when stderr is a pipe to a writer thread
+ * (the reUndr-ps5 host, ps5/src/main_ps5.c, sets it); -1 elsewhere. */
+int g_crash_log_fd = -1;
 
 static void crash_signal(int sig, siginfo_t *si, void *uc)
 {
-    (void)uc;
+    if (g_crash_log_fd >= 0) {
+        /* Let the writer thread drain the pipe, then write past it: the
+         * process dies before the writer would see the report. */
+        struct timespec ts = { 0, 150 * 1000 * 1000 };
+        fflush(stderr);
+        nanosleep(&ts, NULL);
+        dup2(g_crash_log_fd, fileno(stderr));
+        setvbuf(stderr, NULL, _IONBF, 0);
+    }
     fprintf(stderr, "[CRASH] signal %d, fault addr %p (guest VA 0x%08X)\n",
             sig, si->si_addr,
             (uint32_t)((uintptr_t)si->si_addr - (uintptr_t)g_xbox_mem_offset));
+    /* The load slide: symbolize rip offline as rip - base + nm address. */
+    fprintf(stderr, "[CRASH] base print_guest_state=%p thread=%p\n",
+            (void *)print_guest_state, (void *)pthread_self());
+#ifdef __PROSPERO__
+    fprintf(stderr, "[CRASH] rip=%p\n",
+            (void *)((ucontext_t *)uc)->uc_mcontext.mc_rip);
+#else
+    (void)uc;   /* Linux needs _GNU_SOURCE for REG_RIP; the host has gdb. */
+#endif
     print_guest_state();
     {
         /* The host frames name the lifted function (sub_XXXXXXXX) that
@@ -175,6 +201,9 @@ static void crash_signal(int sig, siginfo_t *si, void *uc)
         fflush(stderr);
         backtrace_symbols_fd(frames, n, 2);
     }
+    if (g_crash_log_fd >= 0)
+        fsync(fileno(stderr));
+
     signal(sig, SIG_DFL);
     raise(sig);
 }
@@ -197,6 +226,7 @@ static void install_crash_reporter(void)
     sigaction(SIGBUS, &sa, NULL);
     sigaction(SIGILL, &sa, NULL);
     sigaction(SIGFPE, &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);   /* vk/pb abort()s; SIG_DFL + raise ends it */
 }
 #endif
 
