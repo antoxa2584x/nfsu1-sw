@@ -40,6 +40,9 @@
  *                                    (default -0.25: a little sharper)
  *   RECOMP_VK_FXAA=0                 present with a plain blit, no FXAA
  *   RECOMP_VK_FXAA_SUBPIX=<s>        FXAA sub-pixel smoothing 0..1 (0.25)
+ *   RECOMP_VK_SSAA=<k>               supersampling: surfaces at k times the
+ *                                    render scale (1..2, default 1 = off),
+ *                                    filtered down in the present pass
  *   RECOMP_VK_VALIDATION=1           (Linux) enable the Khronos validation layer
  *   RECOMP_VK_HEADLESS=1             (Linux) no window, no present
  */
@@ -310,6 +313,10 @@ typedef struct {
  * RECOMP_VK_SQUARE=0 off; RECOMP_GL_SCALE_X overrides it. */
 static double   s_scale = 1.0, s_scale_x = 1.0, s_xratio = 1.0;
 static int      s_square, s_square_env;
+/* RECOMP_VK_SSAA: every surface's stored size times this on top of the scale
+ * (the game's menu and RECOMP_GL_SCALE keep their meaning); the present pass
+ * filters it down to the output (present_fxaa, mode 1/2). */
+static double   s_ssaa = 1.0;
 
 /* Picture options set at run time (NFSU2: Options -> Video), read by the
  * renderer: FXAA on/off (at every present), anisotropic level 1..16 (per
@@ -330,7 +337,7 @@ volatile int nv2a_vk_scale_pct;
  * by the device's image limits. */
 static void stored_size(uint32_t w, uint32_t h, uint32_t aa_sx, uint32_t *pw, uint32_t *ph)
 {
-    double kx = s_scale_x * (s_square && aa_sx <= 1 ? 4.0 / 3.0 : 1.0), ky = s_scale;
+    double kx = s_scale_x * s_ssaa * (s_square && aa_sx <= 1 ? 4.0 / 3.0 : 1.0), ky = s_scale * s_ssaa;
     if (w * kx > (double)s_max_size)
         kx = (double)s_max_size / w;
     if (h * ky > (double)s_max_size)
@@ -2509,6 +2516,11 @@ static int ready(void)
         if (s_scale != 1.0 || s_scale_x != 1.0 || s_square)
             fprintf(stderr, "  [VK] rendering at %g x %g (RECOMP_GL_SCALE[_X])%s, surfaces up to %u\n",
                     s_scale_x, s_scale, s_square ? ", square pixels" : "", s_max_size);
+        e = getenv("RECOMP_VK_SSAA");
+        k = e ? strtod(e, NULL) : 1.0;
+        s_ssaa = !(k > 1.0) ? 1.0 : k > 2.0 ? 2.0 : k;  /* 4 taps filter at most 2:1 */
+        fprintf(stderr, "  [VK] SSAA %gx (RECOMP_VK_SSAA)%s\n", s_ssaa,
+                s_ssaa > 1.0 ? ": surfaces at that times the scale, filtered down at present" : ", off");
     }
     if (s_ubo_align < 16) s_ubo_align = 16;
     vkGetPhysicalDeviceMemoryProperties(s_pd, &s_memprops);
@@ -3808,6 +3820,7 @@ static VkDescriptorSetLayout s_pp_dsl;
 static VkPipelineLayout      s_pp_layout;
 static VkSampler             s_pp_sampler;
 static struct { VkFormat fmt; VkPipeline pipe; } s_pp[2];
+static int                   s_pp_failed;
 
 static const char s_pp_vs[] =
     "#version 450\n"
@@ -3825,15 +3838,14 @@ static const char s_pp_fs[] =
     "float Lat(vec2 uv) { return L(textureLod(src, uv, 0.0).rgb); }\n"
     "#define LO(x, y) L(textureLodOffset(src, uv, 0.0, ivec2(x, y)).rgb)\n"
     "const float Q[8] = float[](1.0, 1.0, 1.0, 1.5, 2.0, 2.0, 4.0, 8.0);\n"
-    "void main() {\n"
-    "    vec2 uv = (gl_FragCoord.xy - pc.rect.xy) / pc.rect.zw;\n"
+    "vec3 fx(vec2 uv) {\n"
     "    vec2 r = pc.rcp.xy;\n"
     "    vec4 cM = textureLod(src, uv, 0.0);\n"
     "    float lM = L(cM.rgb), lD = LO(0, 1), lU = LO(0, -1), lL = LO(-1, 0), lR = LO(1, 0);\n"
     "    float mx = max(lM, max(max(lD, lU), max(lL, lR)));\n"
     "    float mn = min(lM, min(min(lD, lU), min(lL, lR)));\n"
     "    float range = mx - mn;\n"
-    "    if (range < max(0.0312, mx * 0.125)) { o = vec4(cM.rgb, 1.0); return; }\n"
+    "    if (range < max(0.0312, mx * 0.125)) return cM.rgb;\n"
     "    float lDL = LO(-1, 1), lUR = LO(1, -1), lUL = LO(-1, -1), lDR = LO(1, 1);\n"
     "    float lDU = lD + lU, lLR = lL + lR;\n"
     "    float lLc = lDL + lUL, lDc = lDL + lDR, lRc = lDR + lUR, lUc = lUR + lUL;\n"
@@ -3872,7 +3884,18 @@ static const char s_pp_fs[] =
     "    float s2 = (-2.0 * s1 + 3.0) * s1 * s1;\n"
     "    fin = max(fin, s2 * s2 * pc.rcp.z);\n"
     "    if (hor) uv.y += fin * step; else uv.x += fin * step;\n"
-    "    o = vec4(textureLod(src, uv, 0.0).rgb, 1.0);\n"
+    "    return textureLod(src, uv, 0.0).rgb;\n"
+    "}\n"
+    /* rcp.w: 0 FXAA (as before SSAA); 1 SSAA, FXAA in the surface's texels at
+     * each tap; 2 SSAA, plain taps. Four bilinear taps at +-1/4 output pixel:
+     * an exact 2x2 box at 2:1, a tent over the footprint below that. */
+    "vec3 tap(vec2 uv) { return pc.rcp.w > 1.5 ? textureLod(src, uv, 0.0).rgb : fx(uv); }\n"
+    "void main() {\n"
+    "    vec2 uv = (gl_FragCoord.xy - pc.rect.xy) / pc.rect.zw;\n"
+    "    if (pc.rcp.w == 0.0) { o = vec4(fx(uv), 1.0); return; }\n"
+    "    vec2 h = 0.25 / pc.rect.zw;\n"
+    "    o = vec4(0.25 * (tap(uv - h) + tap(uv + h) + tap(uv + vec2(h.x, -h.y))\n"
+    "                     + tap(uv + vec2(-h.x, h.y))), 1.0);\n"
     "}\n";
 
 static int fxaa_on(void)
@@ -3910,6 +3933,8 @@ static VkPipeline pp_pipe(VkFormat fmt)
     for (i = 0; i < 2; i++)
         if (s_pp[i].pipe && s_pp[i].fmt == fmt)
             return s_pp[i].pipe;
+    if (s_pp_failed)                        /* SSAA calls in with FXAA off: build once */
+        return VK_NULL_HANDLE;
     if (!s_pp_layout) {
         VkDescriptorSetLayoutBinding b = { 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
                                            VK_SHADER_STAGE_FRAGMENT_BIT, NULL };
@@ -3976,6 +4001,7 @@ static VkPipeline pp_pipe(VkFormat fmt)
     if (!pipe) {
         LOGE("FXAA pipeline failed; presenting with a blit\n");
         s_fxaa = 0;
+        s_pp_failed = 1;
         return VK_NULL_HANDLE;
     }
     i = s_pp[0].pipe ? 1 : 0;
@@ -4001,8 +4027,15 @@ static int present_fxaa(VkSurf *s, VkImage dst, VkImageView dview, VkFormat fmt,
     VkRect2D sc = { { dx, dy }, { (uint32_t)dw, (uint32_t)dh } };
     VkDescriptorImageInfo ii;
     VkWriteDescriptorSet wr = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-    float pc[8];
+    float pc[8], mode = 0.0f;
 
+    /* SSAA and the surface is taller than the output: filter it down, FXAA'd
+     * per tap below 2:1; at 2:1 and up a pixel has 4 samples and FXAA on top
+     * would only blur. Not larger (a low scale): FXAA or the blit as before. */
+    if (s_ssaa > 1.0 && s->ph > (uint32_t)dh)
+        mode = fxaa_on() && s->ph < 2u * (uint32_t)dh ? 1.0f : 2.0f;
+    else if (!fxaa_on())
+        return 0;
     if (!pipe || !dview)
         return 0;
     end_rendering();
@@ -4040,7 +4073,8 @@ static int present_fxaa(VkSurf *s, VkImage dst, VkImageView dview, VkFormat fmt,
     p_push_desc(s_cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pp_layout, 0, 1, &wr);
     pc[0] = (float)dx; pc[1] = (float)dy; pc[2] = (float)dw; pc[3] = (float)dh;
     pc[4] = 1.0f / (float)s->pw; pc[5] = 1.0f / (float)s->ph;
-    pc[6] = s_fxaa_subpix; pc[7] = 0.0f;
+    pc[6] = s_fxaa_subpix;
+    pc[7] = mode;
     vkCmdPushConstants(s_cb, s_pp_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, pc);
     vkCmdDraw(s_cb, 3, 1, 0, 0);
     p_end_rendering(s_cb);
@@ -4059,12 +4093,13 @@ static int present_fxaa(VkSurf *s, VkImage dst, VkImageView dview, VkFormat fmt,
 static void dump_fxaa(VkSurf *s, const char *path)
 {
     static VkSurf t;
-    if (t.image && (t.pw != s->pw || t.ph != s->ph)) {
+    uint32_t pw = (uint32_t)(s->pw / s_ssaa + 0.5), ph = (uint32_t)(s->ph / s_ssaa + 0.5);
+    if (t.image && (t.pw != pw || t.ph != ph)) {
         garbage_add(t.image, t.view, t.mem);
         memset(&t, 0, sizeof t);
     }
     if (!t.image) {
-        t.pw = s->pw; t.ph = s->ph;
+        t.pw = pw; t.ph = ph;
         if (!make_image(t.pw, t.ph, VK_FORMAT_B8G8R8A8_UNORM,
                         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                         VK_IMAGE_ASPECT_COLOR_BIT, &t.image, &t.view, &t.mem)) {
@@ -4194,7 +4229,7 @@ static void vk_flip(void)
         char path[320];
         snprintf(path, sizeof path, "%s%05u.bmp", dump_prefix, s_frame);
         dump_surface(s, path);
-        if (s_headless && fxaa_on()) {
+        if (s_headless && (fxaa_on() || s_ssaa > 1.0)) {
             snprintf(path, sizeof path, "%s%05u_fxaa.bmp", dump_prefix, s_frame);
             barrier_all();
             dump_fxaa(s, path);
@@ -4228,7 +4263,7 @@ static void vk_flip(void)
                 dw = (int)(lw * scale); dh = (int)(lh * scale);
                 dx = ((int)ww - dw) / 2; dy = ((int)wh - dh) / 2;
             }
-            if (dw > 0 && dh > 0 && fxaa_on()
+            if (dw > 0 && dh > 0 && (fxaa_on() || s_ssaa > 1.0)
                 && present_fxaa(s, dst, s_sc_views[idx], s_sc_format, s_sc_extent, dx, dy, dw, dh,
                                 VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                                 VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT))
