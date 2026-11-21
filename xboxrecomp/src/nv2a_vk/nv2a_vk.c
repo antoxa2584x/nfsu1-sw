@@ -43,6 +43,8 @@
  *   RECOMP_VK_SSAA=<k>               supersampling: surfaces at k times the
  *                                    render scale (1..2, default 1 = off),
  *                                    filtered down in the present pass
+ *   RECOMP_VK_CUBE_UP=<m>            car reflection cube faces at m times the
+ *                                    render scale (1..4, default 1 = off)
  *   RECOMP_VK_VALIDATION=1           (Linux) enable the Khronos validation layer
  *   RECOMP_VK_HEADLESS=1             (Linux) no window, no present
  */
@@ -333,11 +335,55 @@ static uint32_t s_max_size = 4096;
  * flip (rescale_surfaces). */
 volatile int nv2a_vk_scale_pct;
 
-/* The stored size of a w x h surface at the current scale, capped per axis
- * by the device's image limits. */
-static void stored_size(uint32_t w, uint32_t h, uint32_t aa_sx, uint32_t *pw, uint32_t *ph)
+/* RECOMP_VK_CUBE_UP=<m> (default 1 = off, up to 4): the faces of a
+ * render-to-cube reflection map (the car reflections) get m times the render
+ * scale -- sharper reflections. A surface becomes a face when a cube map is
+ * bound over its address (cube_note_face); the next flip rebuilds it
+ * (rescale_surfaces) and cube_from_surfaces sizes the cube from it. */
+static double   s_cube_up = -1.0;
+static uint32_t s_cube_va[32];
+static int      s_ncube_va, s_cube_pending;
+static int cube_face_va(uint32_t va)
 {
-    double kx = s_scale_x * s_ssaa * (s_square && aa_sx <= 1 ? 4.0 / 3.0 : 1.0), ky = s_scale * s_ssaa;
+    int i;
+    for (i = 0; i < s_ncube_va; i++)
+        if (s_cube_va[i] == va) return 1;
+    return 0;
+}
+static void cube_up_init(void)
+{
+    const char *e = getenv("RECOMP_VK_CUBE_UP");
+    s_cube_up = e ? atof(e) : 1.0;
+    if (!(s_cube_up > 1.0)) s_cube_up = 1.0;
+    if (s_cube_up > 4.0) s_cube_up = 4.0;
+    fprintf(stderr, "  [VK] reflection cube faces at %gx the render scale (RECOMP_VK_CUBE_UP)%s\n",
+            s_cube_up, s_cube_up > 1.0 ? "" : ", off");
+}
+static void cube_note_face(uint32_t va)
+{
+    if (s_cube_up < 0.0) cube_up_init();
+    if (s_cube_up <= 1.0 || cube_face_va(va) || s_ncube_va >= 32) return;
+    s_cube_va[s_ncube_va++] = va;
+    s_cube_pending = 1;
+}
+/* vk_flip: faces found since the last flip need rebuilding (rescale_surfaces). */
+static int cube_resize_due(void)
+{
+    int r = s_cube_pending;
+    s_cube_pending = 0;
+    return r;
+}
+
+/* The stored size of a w x h surface at the current scale (times RECOMP_VK_SSAA,
+ * and RECOMP_VK_CUBE_UP for a reflection face), capped per axis by the
+ * device's image limits. */
+static void stored_size(uint32_t va, uint32_t w, uint32_t h, uint32_t aa_sx, uint32_t *pw, uint32_t *ph)
+{
+    double sxk = s_scale_x * s_ssaa, syk = s_scale * s_ssaa, kx, ky;
+    if (cube_face_va(va)) {                 /* only listed with CUBE_UP set */
+        sxk *= s_cube_up; syk *= s_cube_up;
+    }
+    kx = sxk * (s_square && aa_sx <= 1 ? 4.0 / 3.0 : 1.0); ky = syk;
     if (w * kx > (double)s_max_size)
         kx = (double)s_max_size / w;
     if (h * ky > (double)s_max_size)
@@ -752,7 +798,7 @@ static VkSurf *surf_get(uint32_t va, uint32_t w, uint32_t h, uint32_t aa_sx, uin
     memset(s, 0, sizeof *s);
     s->va = va; s->w = w; s->h = h; s->used = s_frame;
     s->aa_sx = aa_sx; s->aa_sy = aa_sy;
-    stored_size(w, h, aa_sx, &s->pw, &s->ph);
+    stored_size(va, w, h, aa_sx, &s->pw, &s->ph);
     if (!make_image(s->pw, s->ph, VK_FORMAT_B8G8R8A8_UNORM,
                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
@@ -788,7 +834,7 @@ static void rescale_surfaces(double k)
         uint32_t pw, ph;
         if (!s->image)
             continue;
-        stored_size(s->w, s->h, s->aa_sx, &pw, &ph);
+        stored_size(s->va, s->w, s->h, s->aa_sx, &pw, &ph);
         if (pw == s->pw && ph == s->ph)
             continue;
         if (!make_image(pw, ph, VK_FORMAT_B8G8R8A8_UNORM,
@@ -1354,6 +1400,8 @@ static VkImageView cube_from_surfaces(uint32_t va, uint32_t w, uint32_t h, uint3
             LOGE("cube 0x%08X %ux%u from surfaces (stored %u)\n", va, w, h, size);
     }
     c->used = s_frame;
+    for (f = 0; f < 6; f++)
+        if (faces[f]) cube_note_face(faces[f]->va);
     for (f = 0; f < 6; f++) {
         VkSurf *sf = faces[f];
         VkImageBlit bl;
@@ -2542,6 +2590,7 @@ static int ready(void)
             s_aniso = 1.0f;
         if (s_aniso > pp.limits.maxSamplerAnisotropy)
             s_aniso = pp.limits.maxSamplerAnisotropy;
+        cube_up_init();                     /* boot line; else at the first cube */
     }
     {
         VkFormatProperties fp;
@@ -4219,7 +4268,7 @@ static void vk_flip(void)
         int sq = s_square_env && nv2a_vk_square;
         if (!(k > 0.0))
             k = s_scale;
-        if (k != s_scale || sq != s_square) {
+        if (k != s_scale || sq != s_square || cube_resize_due()) {
             s_square = sq;
             rescale_surfaces(k);
         }
